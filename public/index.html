@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>VeriBrowse</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>VeriBrowse</h1>
+      <p>Verified Browser Automation</p>
+    </header>
+
+    <main>
+      <div class="input-section">
+        <label for="taskInput">What do you want me to do?</label>
+        <textarea id="taskInput" rows="3" placeholder="Find the refund page on Skyscanner"></textarea>
+        <button id="runBtn">Run</button>
+      </div>
+
+      <div class="status-section" id="statusSection" style="display:none;">
+        <div class="status-header">
+          <span id="currentStatusLabel" class="status-badge">Starting...</span>
+        </div>
+        <div id="logArea" class="log-area"></div>
+      </div>
+
+      <div class="intervention-section" id="interventionSection" style="display:none;">
+        <h3>HUMAN INTERVENTION REQUIRED</h3>
+        <p id="interventionReason"></p>
+        <p>VeriBrowse will not invent or enter this data. Please complete the required action in the browser.</p>
+        <button id="continueBtn">Continue</button>
+        <button id="stopBtn" class="danger">Stop Agent</button>
+      </div>
+
+      <div class="result-section" id="resultSection" style="display:none;">
+        <h3>VERIFIED RESULT</h3>
+        <p id="resultText"></p>
+      </div>
+    </main>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>

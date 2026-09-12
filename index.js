@@ -457,12 +457,18 @@ Return ONLY valid JSON. No markdown, no explanation outside the JSON.`;
 // Agent loop
 // ---------------------------------------------------------------------------
 
-async function runAgent(task, rl) {
+async function runAgent(task, options = {}) {
+  const emit = (event) => { if (options.onEvent) options.onEvent(event); };
+
   console.log(`\nStarting task: "${task}"\n`);
+  emit({ type: 'task_started', task });
   
   console.log('Extracting target domain constraints…');
   const targetDomain = await extractTargetDomain(task);
-  if (targetDomain) console.log(`  Target constraint: ${targetDomain}`);
+  if (targetDomain) {
+    console.log(`  Target constraint: ${targetDomain}`);
+    emit({ type: 'domain_constraint', domain: targetDomain });
+  }
 
   const messages = [{ role: 'system', content: PLANNER_SYSTEM_PROMPT }];
   let currentState, currentStateText;
@@ -500,6 +506,7 @@ async function runAgent(task, rl) {
     console.log(`\n${initialBlocker.message}`);
     console.log('The current page has a challenge that requires human intervention.');
     console.log('Please complete the challenge in the browser, then re-run VeriBrowse.');
+    emit({ type: 'human_intervention', reason: 'CAPTCHA detected on initial page', message: initialBlocker.message });
     return;
   }
 
@@ -512,9 +519,11 @@ async function runAgent(task, rl) {
   // --- Main loop ---
   for (let step = 1; step <= MAX_LOOPS; step++) {
     console.log(`\n━━━ Step ${step}/${MAX_LOOPS} ━━━`);
+    emit({ type: 'step', step, total: MAX_LOOPS });
 
     // 1. Ask planner
     console.log('Asking planner…');
+    emit({ type: 'planning' });
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages,
@@ -526,10 +535,12 @@ async function runAgent(task, rl) {
       action = JSON.parse(response.choices[0].message.content);
     } catch {
       console.error('Planner returned invalid JSON. Stopping.');
+      emit({ type: 'error', message: 'Planner returned invalid JSON' });
       break;
     }
 
     console.log(`Action: ${JSON.stringify(action)}`);
+    emit({ type: 'action', action });
     messages.push({ role: 'assistant', content: JSON.stringify(action) });
 
     // Prevent repeating a failed action on the same page
@@ -563,20 +574,25 @@ async function runAgent(task, rl) {
       if (action.result?.toLowerCase().includes('could not')) {
         console.log(`\nTask terminated!`);
         console.log(`Result: ${action.result}`);
+        emit({ type: 'terminated', result: action.result });
         return;
       }
       
       console.log('🔎 Verifying task completion…');
+      emit({ type: 'verifying_completion' });
       const completion = await verifyCompletion(task, currentStateText, action.result);
       if (completion.complete) {
         console.log(`\n✅ Task completed!`);
         console.log(`Result: ${action.result}`);
+        emit({ type: 'success', result: action.result });
         return;
       } else {
         console.log(`❌ COMPLETION REJECTED: ${completion.reason}`);
+        emit({ type: 'completion_rejected', reason: completion.reason });
         consecutiveFailures++;
         if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
           console.log('Too many consecutive failures without progress. Stopping.');
+          emit({ type: 'error', message: 'Too many consecutive failures' });
           return;
         }
         messages.push({
@@ -591,15 +607,21 @@ async function runAgent(task, rl) {
       console.log(`\nHUMAN INTERVENTION REQUIRED`);
       console.log(`   Reason: ${action.reason}`);
       console.log('');
+      emit({ type: 'human_intervention', reason: action.reason });
 
       // Offer to wait for the human to resolve
-      const answer = await askUser(rl, 'Complete the challenge in the browser, then type "done" to continue (or "quit" to stop): ');
-      if (answer.trim().toLowerCase() === 'quit') {
-        console.log('Agent stopped by user.');
-        return;
+      if (options.askUser) {
+        const answer = await options.askUser('Complete the challenge in the browser, then type "done" to continue (or "quit" to stop): ');
+        if (answer.trim().toLowerCase() === 'quit') {
+          console.log('Agent stopped by user.');
+          emit({ type: 'terminated', result: 'Stopped by user during human intervention.' });
+          return;
+        }
+        console.log('Continuing...');
+      } else {
+        return; // stop if no askUser provided
       }
-      // Human says done — get fresh snapshot and continue
-      console.log('Taking fresh snapshot after human intervention…');
+
       try {
         currentState = await getSnapshot();
         currentStateText = snapshotToText(currentState);
@@ -670,6 +692,17 @@ async function runAgent(task, rl) {
         console.log(`I will not invent or enter personal information.`);
         console.log(`Please enter the required information in the browser.`);
         console.log(`VeriBrowse has paused.\n`);
+        emit({ type: 'human_intervention', reason: 'Sensitive input field detected', field: action.target });
+        
+        if (options.askUser) {
+           const answer = await options.askUser('Enter information in the browser, then type "done" to continue (or "quit" to stop): ');
+           if (answer.trim().toLowerCase() === 'quit') {
+             emit({ type: 'terminated', result: 'Stopped by user during sensitive input.' });
+             return;
+           }
+           messages.push({ role: 'user', content: `I have entered the sensitive information. Please continue.` });
+           continue;
+        }
         return;
       }
     } else if (action.action === 'click') {
@@ -689,6 +722,17 @@ async function runAgent(task, rl) {
         console.log(`I will not make purchases or irreversible actions automatically.`);
         console.log(`Please complete this step in the browser.`);
         console.log(`VeriBrowse has paused.\n`);
+        emit({ type: 'human_intervention', reason: 'Irreversible action detected', action: action.target });
+
+        if (options.askUser) {
+           const answer = await options.askUser('Confirm the action in the browser, then type "done" to continue (or "quit" to stop): ');
+           if (answer.trim().toLowerCase() === 'quit') {
+             emit({ type: 'terminated', result: 'Stopped by user.' });
+             return;
+           }
+           messages.push({ role: 'user', content: `I have completed the irreversible action. Please continue.` });
+           continue;
+        }
         return;
       }
     }
@@ -705,6 +749,7 @@ async function runAgent(task, rl) {
 
     // 5. Execute via WebCMD
     console.log(`Executing: ${script}`);
+    emit({ type: 'executing', script });
     let execError = null;
     let newTabOpened = false;
     let activeTabBefore = null;
@@ -732,15 +777,18 @@ async function runAgent(task, rl) {
     } catch (err) {
       // Infrastructure failure — stop agent
       console.error(`Infrastructure failure: ${err.message}`);
+      emit({ type: 'error', message: `Infrastructure failure: ${err.message}` });
       return;
     }
 
     if (execError) {
       consecutiveFailures++;
       console.log(`ACTION EXECUTION FAILED: ${execError}`);
+      emit({ type: 'action_failed', error: execError });
 
       if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
         console.log('Too many consecutive failures. Stopping.');
+        emit({ type: 'error', message: 'Too many consecutive failures' });
         return;
       }
 
@@ -816,9 +864,11 @@ async function runAgent(task, rl) {
 
     // 8. Verify
     console.log('Verifying action result…');
+    emit({ type: 'verifying' });
     const verification = await verifyAction(task, currentStateText, action, newStateText);
     const icon = verification.verified ? '✅' : '❌';
     console.log(`${icon} Verification: ${verification.verified ? 'SUCCESS' : 'FAILED'} — ${verification.reason}`);
+    emit({ type: 'verified', success: verification.verified, reason: verification.reason });
 
     if (verification.verified) {
       consecutiveFailures = 0;
@@ -830,6 +880,7 @@ async function runAgent(task, rl) {
       consecutiveFailures++;
       if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
         console.log('Too many consecutive failures without progress. Stopping.');
+        emit({ type: 'error', message: 'Too many consecutive failures without progress.' });
         return;
       }
       messages.push({
@@ -848,6 +899,7 @@ async function runAgent(task, rl) {
   }
 
   console.log(`\nReached step limit (${MAX_LOOPS}). Stopping.`);
+  emit({ type: 'error', message: `Reached step limit (${MAX_LOOPS})` });
 }
 
 // ---------------------------------------------------------------------------
@@ -882,7 +934,7 @@ async function main() {
   }
 
   try {
-    await runAgent(task.trim(), rl);
+    await runAgent(task.trim(), { askUser: (q) => askUser(rl, q) });
   } catch (err) {
     console.error('\nFatal error:', err.message || err);
   }
@@ -890,4 +942,11 @@ async function main() {
   rl.close();
 }
 
-main();
+if (require.main === module) {
+  main();
+}
+
+module.exports = {
+  runAgent,
+  extractTargetDomain
+};
