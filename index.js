@@ -222,9 +222,9 @@ function actionToPlaywright(action) {
       const text = escapeJS(action.text || '');
       if (action.role) {
         const role = escapeJS(action.role);
-        return `await page.getByRole('${role}', { name: '${target}' }).first().fill('${text}');`;
+        return `await page.getByRole('${role}', { name: '${target}', exact: true }).first().fill('${text}', { timeout: 5000 });`;
       }
-      return `await page.getByPlaceholder('${target}').first().fill('${text}');`;
+      return `await page.getByPlaceholder('${target}').first().fill('${text}', { timeout: 5000 });`;
     }
     case 'extract':
       // Use the snapshot read mode instead of raw innerText
@@ -312,8 +312,8 @@ Click an element (COPY the ref, role, and name EXACTLY from the snapshot):
 {"action": "click", "ref": "l3", "target": "exact text from snapshot", "role": "link|button|tab|menuitem", "href": "/path (for links, if shown in snapshot)"}
 IMPORTANT: Copy the element text EXACTLY as it appears in the snapshot, including capitalization. Do not paraphrase or reconstruct it. Include href for links when the snapshot shows it.
 
-Type into a field:
-{"action": "type", "target": "field label or placeholder", "text": "what to type", "role": "textbox|combobox|searchbox (optional)"}
+Type into a field (COPY the ref, role, and name EXACTLY from the snapshot):
+{"action": "type", "ref": "l14", "target": "exact text from snapshot", "text": "what to type", "role": "textbox|combobox|searchbox (optional)"}
 
 Navigate (RESTRICTED — only for explicit user-provided URLs):
 {"action": "navigate", "url": "https://…"}
