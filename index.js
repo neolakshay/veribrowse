@@ -411,7 +411,7 @@ CRITICAL RULES:
 2. Do NOT invent URLs. Use "navigate" ONLY if the user explicitly gave a URL AND you are not there yet.
 3. Prefer "click" on links/buttons already in the snapshot for navigation.
 4. Use "type" to fill input fields, search boxes, or text areas visible in the snapshot.
-5. Use "extract" only when you need to read the page content to answer the user's question.
+5. Use "extract" only when you need to read the page content to answer the user's task. You MUST explicitly specify exactly what fields you need in the "what" property (e.g. "exact current location, current delay, next station"). Do NOT guess or fabricate missing values.
 6. Use "wait" if a page is loading or you just submitted a form.
 7. If a CAPTCHA, "verify you are human", or similar challenge is visible, return:
    {"action": "human_needed", "reason": "CAPTCHA or verification challenge detected."}
@@ -423,9 +423,10 @@ CRITICAL RULES:
 FAILURE HANDLING:
 - ACTION_EXECUTION_FAILURE means the Playwright command crashed (element not found, timeout, etc.). 
   → Try a DIFFERENT selector or approach. Do NOT retry the exact same action.
-- VERIFICATION_FAILURE means the action ran but did NOT make progress toward the task.
-  → Reassess deeply. If no logical next step exists, return "finish".
-- Never repeat a failed action more than once with the same target.
+- VERIFICATION_FAILURE means the action ran but the ultimate goal is not reached yet.
+  → If the page changed meaningfully (e.g., reaching a homepage), this is PROGRESS. Not every verification failure means the previous action was wrong. Reassess the current snapshot and continue toward the explicit destination.
+  → If the state did NOT change, reassess deeply. Do not repeatedly perform the same failed action.
+  → Only choose finish when the goal is actually achieved or no verified path remains.
 
 AVAILABLE ACTIONS (return exactly one as JSON):
 
@@ -440,7 +441,7 @@ Navigate (RESTRICTED — only for explicit user-provided URLs):
 {"action": "navigate", "url": "https://…"}
 
 Read/extract page content:
-{"action": "extract", "what": "description of what to extract"}
+{"action": "extract", "what": "EXPLICIT description of the exact fields/information you need to extract based on the user's task."}
 
 Wait for page to load:
 {"action": "wait", "ms": 2000}
@@ -597,7 +598,7 @@ async function runAgent(task, options = {}) {
         }
         messages.push({
           role: 'user',
-          content: `COMPLETION REJECTED.\nYou attempted to finish, but the user's task is not yet complete.\nReason: ${completion.reason}\n\nContinue browsing to complete the task, or return {"action": "human_needed", "reason": "..."} if sensitive user input or human action is required.`
+          content: `COMPLETION REJECTED.\nYou attempted to finish, but the user's task is not yet complete.\nReason: ${completion.reason}\n\nIf the information is missing from the current page but a clear next step exists (like a 'Get Status' button), take that action. If the required information is definitively unavailable and there is no logical path forward, return {"action": "finish", "result": "The requested data could not be verified on this page."} rather than wandering to unrelated links.`
         });
         continue;
       }
@@ -664,7 +665,7 @@ async function runAgent(task, options = {}) {
 
       messages.push({
         role: 'user',
-        content: `Extraction result (read-mode snapshot):\n${extractedContent}\n\nDoes this contain the answer to the task? If yes, return "finish" with the result. If not, choose the next action.\n\nTask reminder: ${task}`,
+        content: `Extraction result (read-mode snapshot) for your query "${action.what}":\n${extractedContent}\n\nAnalyze this content carefully against the task requirements. \n- If ALL requested information is explicitly present, return "finish" with the verified result.\n- If fields are MISSING or STALE, do NOT fabricate them. If there is a clear next step on this page to get the live data, take it. \n- If the required data is simply unavailable, return "finish" stating exactly which fields could not be found.\n\nTask reminder: ${task}`,
       });
       consecutiveFailures = 0;
       continue;
@@ -877,21 +878,32 @@ async function runAgent(task, options = {}) {
         content: `Action verified as SUCCESSFUL. Reason: ${verification.reason}\n\nNew Browser State:\n${newStateText}\n\nTask reminder: ${task}\n\nWhat is your next action?`,
       });
     } else {
-      consecutiveFailures++;
-      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-        console.log('Too many consecutive failures without progress. Stopping.');
-        emit({ type: 'error', message: 'Too many consecutive failures without progress.' });
-        return;
+      // Meaningful state change check (e.g., URL or title change)
+      const pageChanged = (currentState?.page?.url !== newState?.page?.url) || (currentState?.page?.title !== newState?.page?.title);
+      
+      if (pageChanged) {
+        consecutiveFailures = 0;
+        messages.push({
+          role: 'user',
+          content: `Action executed successfully, but the requested destination/goal has not been reached yet.\nReason: ${verification.reason}\n\nThe browser state has changed meaningfully. This is an intermediate step. Reassess the current page and continue toward the goal.\n\nNew Browser State:\n${newStateText}\n\nTask reminder: ${task}\n\nWhat is your next action?`
+        });
+      } else {
+        consecutiveFailures++;
+        if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+          console.log('Too many consecutive failures without progress. Stopping.');
+          emit({ type: 'error', message: 'Too many consecutive failures without progress.' });
+          return;
+        }
+        messages.push({
+          role: 'user',
+          content: `VERIFICATION FAILED — the action did NOT make progress toward the task.\nFailed action was: ${JSON.stringify(action)}\nReason: ${verification.reason}\n\nDo NOT repeat this exact action (same ref/target). Do NOT click random links. Reassess the current state.\nIf the task is impossible from this page, return "finish".\nConsecutive failures: ${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES}.\n\nNew Browser State:\n${newStateText}\n\nTask reminder: ${task}\n\nWhat is your next action?`,
+        });
+        failedActions.push({
+          pageUrl: currentState.page?.url,
+          action: action,
+          reason: 'Verification failed: ' + verification.reason
+        });
       }
-      messages.push({
-        role: 'user',
-        content: `VERIFICATION FAILED — the action did NOT make progress toward the task.\nFailed action was: ${JSON.stringify(action)}\nReason: ${verification.reason}\n\nDo NOT repeat this exact action (same ref/target). Do NOT click random links. Reassess the current state.\nIf the task is impossible from this page, return "finish".\nConsecutive failures: ${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES}.\n\nNew Browser State:\n${newStateText}\n\nTask reminder: ${task}\n\nWhat is your next action?`,
-      });
-      failedActions.push({
-        pageUrl: currentState.page?.url,
-        action: action,
-        reason: 'Verification failed: ' + verification.reason
-      });
     }
 
     currentState = newState;
