@@ -74,7 +74,8 @@ async function safeRunWebCmd(command, stdinData = null) {
       if (code === 'session_not_found' || code === 'SESSION_REQUIRED') {
         console.warn(`  [Infra] Session missing (${code}). Attempting recovery…`);
         try {
-          await runWebCmd('run --stdin', 'await page.goto("about:blank");');
+          // Wake up the session without destroying the current page
+          await runWebCmd('run --stdin', 'return true;');
           console.log('  [Infra] Session recovered. Retrying…');
           continue;
         } catch (e2) {
@@ -203,28 +204,62 @@ function actionToPlaywright(action) {
       const target = escapeJS(action.target || '');
       const role = action.role ? escapeJS(action.role) : null;
       const href = action.href ? escapeJS(action.href) : null;
-      // Priority: role+name (exact) > role+name (fuzzy) > href > text
+      
+      const scriptLines = [
+        `async function robustClick(loc) {`,
+        `  if (await loc.count() === 0) return false;`,
+        `  try { await loc.first().click({ timeout: 3000 }); return true; }`,
+        `  catch(e) {`,
+        `    try { await loc.first().dispatchEvent('click', { timeout: 2000 }); return true; }`,
+        `    catch(e2) { return false; }`,
+        `  }`,
+        `}`
+      ];
+      
       if (role && href) {
-        // Try role+name exact, fall back to href-based locator
-        return `await (async () => {
-  const el = page.getByRole('${role}', { name: '${target}', exact: true });
-  if (await el.count() > 0) { await el.first().click({ timeout: 5000 }); return; }
-  await page.locator('${role === 'link' ? 'a' : role}[href*="${href}"]').first().click({ timeout: 5000 });
-})();`;
+        const path = href.replace(/^https?:\/\/[^\/]+/, '');
+        scriptLines.push(`let el = page.locator('${role === 'link' ? 'a' : role}[href*="${path}"]');`);
+        scriptLines.push(`if (await robustClick(el)) return;`);
       }
       if (role) {
-        return `await page.getByRole('${role}', { name: '${target}', exact: true }).first().click({ timeout: 5000 });`;
+        scriptLines.push(`el = page.getByRole('${role}', { name: '${target}', exact: true });`);
+        scriptLines.push(`if (await robustClick(el)) return;`);
+        scriptLines.push(`el = page.getByRole('${role}', { name: '${target}' });`);
+        scriptLines.push(`if (await robustClick(el)) return;`);
       }
-      return `await page.getByText('${target}', { exact: false }).first().click({ timeout: 5000 });`;
+      scriptLines.push(`el = page.getByText('${target}');`);
+      scriptLines.push(`if (await robustClick(el)) return;`);
+      scriptLines.push(`throw new Error('Element not found or not clickable');`);
+      
+      return `await (async () => {\n  ${scriptLines.join('\n  ')}\n})();`;
     }
     case 'type': {
       const target = escapeJS(action.target || '');
       const text = escapeJS(action.text || '');
-      if (action.role) {
-        const role = escapeJS(action.role);
-        return `await page.getByRole('${role}', { name: '${target}', exact: true }).first().fill('${text}', { timeout: 5000 });`;
+      const role = action.role ? escapeJS(action.role) : null;
+      
+      const scriptLines = [
+        `async function robustFill(loc, text) {`,
+        `  if (await loc.count() === 0) return false;`,
+        `  try { await loc.first().fill(text, { timeout: 3000 }); return true; }`,
+        `  catch(e) {`,
+        `    try { await loc.first().dispatchEvent('focus'); await loc.first().fill(text, { force: true, timeout: 2000 }); return true; }`,
+        `    catch(e2) { return false; }`,
+        `  }`,
+        `}`
+      ];
+      
+      if (role) {
+        scriptLines.push(`let el = page.getByRole('${role}', { name: '${target}', exact: true });`);
+        scriptLines.push(`if (await robustFill(el, '${text}')) return;`);
+        scriptLines.push(`el = page.getByRole('${role}', { name: '${target}' });`);
+        scriptLines.push(`if (await robustFill(el, '${text}')) return;`);
       }
-      return `await page.getByPlaceholder('${target}').first().fill('${text}', { timeout: 5000 });`;
+      scriptLines.push(`el = page.getByPlaceholder('${target}');`);
+      scriptLines.push(`if (await robustFill(el, '${text}')) return;`);
+      scriptLines.push(`throw new Error('Field not found or not fillable');`);
+
+      return `await (async () => {\n  ${scriptLines.join('\n  ')}\n})();`;
     }
     case 'extract':
       // Use the snapshot read mode instead of raw innerText
@@ -343,6 +378,7 @@ async function runAgent(task, rl) {
   let currentState, currentStateText;
   let consecutiveFailures = 0;
   const MAX_CONSECUTIVE_FAILURES = 3;
+  const failedActions = [];
 
   // --- Initial snapshot ---
   console.log('Taking initial browser snapshot…');
@@ -405,6 +441,32 @@ async function runAgent(task, rl) {
 
     console.log(`Action: ${JSON.stringify(action)}`);
     messages.push({ role: 'assistant', content: JSON.stringify(action) });
+
+    // Prevent repeating a failed action on the same page
+    if (action.action !== 'finish' && action.action !== 'human_needed' && action.action !== 'extract') {
+      const isRepeat = failedActions.some(fa => {
+        if (fa.pageUrl !== currentState.page?.url || fa.action.action !== action.action) return false;
+        if (action.action === 'type' && fa.action.text !== action.text) return false;
+        return (
+          (fa.action.ref && fa.action.ref === action.ref) || 
+          (fa.action.target && fa.action.target === action.target)
+        );
+      });
+
+      if (isRepeat) {
+        console.log(`⚠️  Planner repeated a failed action. Intercepting.`);
+        consecutiveFailures++;
+        if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+          console.log('Too many consecutive failures. Stopping.');
+          return;
+        }
+        messages.push({
+          role: 'user',
+          content: `You repeated an action that ALREADY FAILED on this page: ${JSON.stringify(action)}.\n\nDo NOT repeat it. Choose a DIFFERENT grounded action, or return:\n{"action": "finish", "result": "I could not find a verified path to complete the task from the current page."}`
+        });
+        continue;
+      }
+    }
 
     // 2. Handle terminal actions
     if (action.action === 'finish') {
@@ -512,6 +574,11 @@ async function runAgent(task, rl) {
         role: 'user',
         content: `ACTION EXECUTION FAILED.\nFailed action was: ${JSON.stringify(action)}\nError: ${execError}\n\nDo NOT repeat this exact action. The target text may not match what is actually in the DOM. Try a different element, shorter name match, or a different approach entirely.\nConsecutive failures: ${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES}.\n\nCurrent Browser State:\n${currentStateText}\n\nWhat is your next action?`,
       });
+      failedActions.push({
+        pageUrl: currentState.page?.url,
+        action: action,
+        reason: 'Execution failed: ' + execError
+      });
       continue;
     }
 
@@ -561,6 +628,11 @@ async function runAgent(task, rl) {
       messages.push({
         role: 'user',
         content: `VERIFICATION FAILED — the action did NOT make progress toward the task.\nFailed action was: ${JSON.stringify(action)}\nReason: ${verification.reason}\n\nDo NOT repeat this exact action (same ref/target). Do NOT click random links. Reassess the current state.\nIf the task is impossible from this page, return "finish".\nConsecutive failures: ${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES}.\n\nNew Browser State:\n${newStateText}\n\nTask reminder: ${task}\n\nWhat is your next action?`,
+      });
+      failedActions.push({
+        pageUrl: currentState.page?.url,
+        action: action,
+        reason: 'Verification failed: ' + verification.reason
       });
     }
 
