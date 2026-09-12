@@ -74,9 +74,24 @@ async function safeRunWebCmd(command, stdinData = null) {
       if (code === 'session_not_found' || code === 'SESSION_REQUIRED') {
         console.warn(`  [Infra] Session missing (${code}). Attempting recovery…`);
         try {
-          // Wake up the session without destroying the current page
-          await runWebCmd('run --stdin', 'return true;');
-          console.log('  [Infra] Session recovered. Retrying…');
+          // 1. Try to list existing tabs for this session
+          const tabsResult = await runWebCmd('tabs');
+          let bindSuccess = false;
+          
+          if (Array.isArray(tabsResult) && tabsResult.length > 0) {
+            // Prefer the currently selected/active tab, otherwise fallback to the first
+            const targetTab = tabsResult.find(t => t.selected) || tabsResult[0];
+            await runWebCmd(`bind --page ${targetTab.id}`);
+            console.log(`  [Infra] Bound to existing page: ${targetTab.url}`);
+            bindSuccess = true;
+          }
+
+          if (!bindSuccess) {
+            // 2. If no usable tabs exist, initialize a new browser session gently
+            await runWebCmd('run --stdin', 'return true;');
+            console.log('  [Infra] Session initialized. Retrying…');
+          }
+          
           continue;
         } catch (e2) {
           throw new Error(`Session recovery failed: ${e2.message}`);
