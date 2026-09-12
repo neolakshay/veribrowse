@@ -12,6 +12,33 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+async function extractTargetDomain(task) {
+  const prompt = `You are a domain extraction tool.
+Given the user's task, identify if there is an explicitly intended target website, service, or domain.
+If the task mentions a specific service (like "reddit", "minecraft.net", "twitter"), extract its primary domain (e.g., "reddit.com", "minecraft.net", "twitter.com").
+If the task is generic (e.g., "find a recipe for cake", "what is the news"), return null.
+
+Return strict JSON:
+{
+  "domain": "reddit.com" | null
+}`;
+
+  const response = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    messages: [
+      { role: 'system', content: prompt },
+      { role: 'user', content: `Task: ${task}` }
+    ],
+    response_format: { type: 'json_object' }
+  });
+  
+  try {
+    return JSON.parse(response.choices[0].message.content).domain;
+  } catch {
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // WebCMD CLI helpers
 // ---------------------------------------------------------------------------
@@ -432,6 +459,10 @@ Return ONLY valid JSON. No markdown, no explanation outside the JSON.`;
 
 async function runAgent(task, rl) {
   console.log(`\nStarting task: "${task}"\n`);
+  
+  console.log('Extracting target domain constraints…');
+  const targetDomain = await extractTargetDomain(task);
+  if (targetDomain) console.log(`  Target constraint: ${targetDomain}`);
 
   const messages = [{ role: 'system', content: PLANNER_SYSTEM_PROMPT }];
   let currentState, currentStateText;
@@ -675,8 +706,26 @@ async function runAgent(task, rl) {
     // 5. Execute via WebCMD
     console.log(`Executing: ${script}`);
     let execError = null;
+    let newTabOpened = false;
+    let activeTabBefore = null;
+    
     try {
+      const beforeTabs = await runWebCmd('tabs').catch(() => []);
+      const beforeTabIds = new Set(Array.isArray(beforeTabs) ? beforeTabs.map(t => t.id) : []);
+      activeTabBefore = Array.isArray(beforeTabs) ? beforeTabs.find(t => t.selected)?.id : null;
+
       const runResult = await safeRunWebCmd('run --stdin --timeout 15', script);
+      
+      const afterTabs = await runWebCmd('tabs').catch(() => []);
+      if (Array.isArray(afterTabs)) {
+        const newTab = afterTabs.find(t => !beforeTabIds.has(t.id));
+        if (newTab) {
+          console.log(`Detected new tab opened: ${newTab.url}. Binding to it...`);
+          await runWebCmd(`bind --page ${newTab.id}`);
+          newTabOpened = true;
+        }
+      }
+
       if (runResult?.error) {
         execError = runResult.error.message || JSON.stringify(runResult.error);
       }
@@ -715,6 +764,39 @@ async function runAgent(task, rl) {
     } catch (err) {
       console.error(`Infrastructure error getting post-action snapshot: ${err.message}`);
       return;
+    }
+
+    // 6.5 Domain Drift Check
+    if (targetDomain && newState?.page?.url) {
+      try {
+        const u = new URL(newState.page.url);
+        const hostname = u.hostname.toLowerCase();
+        // Allow search engines and blank pages as intermediaries
+        const isSearchEngine = ['google.', 'bing.', 'yahoo.', 'duckduckgo.', 'about:blank'].some(se => hostname.includes(se));
+        const domainBase = targetDomain.split('.')[0].toLowerCase();
+        const isTarget = hostname.includes(domainBase);
+        
+        if (!isSearchEngine && !isTarget && u.protocol !== 'about:') {
+          console.log(`\n⚠️ DOMAIN DRIFT DETECTED: Navigated to unrelated domain ${hostname}`);
+          console.log(`Rolling back navigation...`);
+          
+          if (newTabOpened && activeTabBefore) {
+            await runWebCmd(`bind --page ${activeTabBefore}`);
+          } else {
+            await safeRunWebCmd('run --stdin', 'await page.goBack().catch(() => {});');
+          }
+          newState = await getSnapshot();
+          
+          consecutiveFailures++;
+          messages.push({
+            role: 'user',
+            content: `ACTION REJECTED: DOMAIN DRIFT.\nYour action navigated to an unrelated service ('${hostname}').\nThe task is constrained to '${targetDomain}' (and search engines).\nI have restored the previous page.\nChoose a different path.`
+          });
+          currentState = newState;
+          currentStateText = snapshotToText(newState);
+          continue;
+        }
+      } catch(e) {}
     }
 
     const newStateText = snapshotToText(newState);
