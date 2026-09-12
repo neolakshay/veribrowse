@@ -110,7 +110,7 @@ async function getSnapshot() {
   const data = await safeRunWebCmd('snapshot --snapshot-mode act');
   // Warn about truncation so we know
   if (data?.limits?.snapshotTruncated) {
-    console.warn('  ⚠ Snapshot was truncated by WebCMD');
+    console.warn('  Snapshot was truncated by WebCMD');
   }
   return data;
 }
@@ -337,7 +337,7 @@ Return ONLY valid JSON. No markdown, no explanation outside the JSON.`;
 // ---------------------------------------------------------------------------
 
 async function runAgent(task, rl) {
-  console.log(`\n🔍 Starting task: "${task}"\n`);
+  console.log(`\nStarting task: "${task}"\n`);
 
   const messages = [{ role: 'system', content: PLANNER_SYSTEM_PROMPT }];
   let currentState, currentStateText;
@@ -345,19 +345,33 @@ async function runAgent(task, rl) {
   const MAX_CONSECUTIVE_FAILURES = 3;
 
   // --- Initial snapshot ---
-  console.log('📸 Taking initial browser snapshot…');
+  console.log('Taking initial browser snapshot…');
   try {
     currentState = await getSnapshot();
   } catch (err) {
-    console.error('❌ Cannot start: infrastructure error getting initial snapshot.');
+    console.error('Cannot start: infrastructure error getting initial snapshot.');
     console.error(`   ${err.message}`);
     return;
+  }
+
+  // --- Startup navigation if on about:blank ---
+  if (currentState?.page?.url === 'about:blank' || currentState?.page?.url === 'chrome://newtab/') {
+    const urlMatch = task.match(/https?:\/\/[^\s]+/);
+    const startUrl = urlMatch ? urlMatch[0] : 'https://www.google.com';
+    console.log(`Initializing empty browser to starting URL: ${startUrl}`);
+    try {
+      await safeRunWebCmd('run --stdin --timeout 15', `await page.goto('${escapeJS(startUrl)}', { waitUntil: 'domcontentloaded', timeout: 15000 });`);
+      currentState = await getSnapshot();
+    } catch (err) {
+      console.error(`Failed to initialize starting URL: ${err.message}`);
+      return;
+    }
   }
 
   // Check for blocker on the very first page
   const initialBlocker = detectBlocker(currentState);
   if (initialBlocker) {
-    console.log(`\n⚠️  ${initialBlocker.message}`);
+    console.log(`\n${initialBlocker.message}`);
     console.log('The current page has a challenge that requires human intervention.');
     console.log('Please complete the challenge in the browser, then re-run VeriBrowse.');
     return;
@@ -374,7 +388,7 @@ async function runAgent(task, rl) {
     console.log(`\n━━━ Step ${step}/${MAX_LOOPS} ━━━`);
 
     // 1. Ask planner
-    console.log('🧠 Asking planner…');
+    console.log('Asking planner…');
     const response = await openai.chat.completions.create({
       model: 'gpt-4o-mini',
       messages,
@@ -385,22 +399,22 @@ async function runAgent(task, rl) {
     try {
       action = JSON.parse(response.choices[0].message.content);
     } catch {
-      console.error('❌ Planner returned invalid JSON. Stopping.');
+      console.error('Planner returned invalid JSON. Stopping.');
       break;
     }
 
-    console.log(`📋 Action: ${JSON.stringify(action)}`);
+    console.log(`Action: ${JSON.stringify(action)}`);
     messages.push({ role: 'assistant', content: JSON.stringify(action) });
 
     // 2. Handle terminal actions
     if (action.action === 'finish') {
-      console.log(`\n✅ Task ${action.result?.includes('could not') ? 'terminated' : 'completed'}!`);
-      console.log(`📝 Result: ${action.result}`);
+      console.log(`\nTask ${action.result?.includes('could not') ? 'terminated' : 'completed'}!`);
+      console.log(`Result: ${action.result}`);
       return;
     }
 
     if (action.action === 'human_needed') {
-      console.log(`\n🛑 HUMAN INTERVENTION REQUIRED`);
+      console.log(`\nHUMAN INTERVENTION REQUIRED`);
       console.log(`   Reason: ${action.reason}`);
       console.log('');
 
@@ -411,19 +425,19 @@ async function runAgent(task, rl) {
         return;
       }
       // Human says done — get fresh snapshot and continue
-      console.log('📸 Taking fresh snapshot after human intervention…');
+      console.log('Taking fresh snapshot after human intervention…');
       try {
         currentState = await getSnapshot();
         currentStateText = snapshotToText(currentState);
       } catch (err) {
-        console.error(`❌ Infrastructure error after human intervention: ${err.message}`);
+        console.error(`Infrastructure error after human intervention: ${err.message}`);
         return;
       }
 
       // Check if blocker is gone
       const stillBlocked = detectBlocker(currentState);
       if (stillBlocked) {
-        console.log(`⚠️  Challenge still detected: ${stillBlocked.message}`);
+        console.log(`Challenge still detected: ${stillBlocked.message}`);
         console.log('Please try again in the browser.');
         step--; // Don't count this as a step
         continue;
@@ -439,12 +453,12 @@ async function runAgent(task, rl) {
 
     // 3. Handle extract action (use read-mode snapshot, no Playwright execution)
     if (action.action === 'extract') {
-      console.log('📖 Extracting page content via read-mode snapshot…');
+      console.log('Extracting page content via read-mode snapshot…');
       let readData;
       try {
         readData = await safeRunWebCmd('snapshot --snapshot-mode read');
       } catch (err) {
-        console.error(`❌ Infrastructure error: ${err.message}`);
+        console.error(`Infrastructure error: ${err.message}`);
         return;
       }
 
@@ -463,7 +477,7 @@ async function runAgent(task, rl) {
     // 4. Translate action to Playwright
     const script = actionToPlaywright(action);
     if (!script) {
-      console.log('⚠️  Unknown action type — skipping.');
+      console.log('Unknown action type — skipping.');
       messages.push({
         role: 'user',
         content: `Unknown action "${action.action}". Available actions: click, type, navigate, extract, wait, human_needed, finish. Try again.`,
@@ -472,7 +486,7 @@ async function runAgent(task, rl) {
     }
 
     // 5. Execute via WebCMD
-    console.log(`⚡ Executing: ${script}`);
+    console.log(`Executing: ${script}`);
     let execError = null;
     try {
       const runResult = await safeRunWebCmd('run --stdin --timeout 15', script);
@@ -481,16 +495,16 @@ async function runAgent(task, rl) {
       }
     } catch (err) {
       // Infrastructure failure — stop agent
-      console.error(`❌ Infrastructure failure: ${err.message}`);
+      console.error(`Infrastructure failure: ${err.message}`);
       return;
     }
 
     if (execError) {
       consecutiveFailures++;
-      console.log(`⚠️  ACTION EXECUTION FAILED: ${execError}`);
+      console.log(`ACTION EXECUTION FAILED: ${execError}`);
 
       if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-        console.log('❌ Too many consecutive failures. Stopping.');
+        console.log('Too many consecutive failures. Stopping.');
         return;
       }
 
@@ -502,12 +516,12 @@ async function runAgent(task, rl) {
     }
 
     // 6. Post-action snapshot
-    console.log('📸 Taking post-action snapshot…');
+    console.log('Taking post-action snapshot…');
     let newState;
     try {
       newState = await getSnapshot();
     } catch (err) {
-      console.error(`❌ Infrastructure error getting post-action snapshot: ${err.message}`);
+      console.error(`Infrastructure error getting post-action snapshot: ${err.message}`);
       return;
     }
 
@@ -516,7 +530,7 @@ async function runAgent(task, rl) {
     // 7. Check for CAPTCHA after action
     const blocker = detectBlocker(newState);
     if (blocker) {
-      console.log(`\n🛑 ${blocker.message}`);
+      console.log(`\n${blocker.message}`);
       messages.push({
         role: 'user',
         content: `After executing the action, a ${blocker.type} challenge was detected: "${blocker.signal}". Return {"action": "human_needed", "reason": "..."} so the user can resolve it.`,
@@ -527,7 +541,7 @@ async function runAgent(task, rl) {
     }
 
     // 8. Verify
-    console.log('🔎 Verifying action result…');
+    console.log('Verifying action result…');
     const verification = await verifyAction(task, currentStateText, action, newStateText);
     const icon = verification.verified ? '✅' : '❌';
     console.log(`${icon} Verification: ${verification.verified ? 'SUCCESS' : 'FAILED'} — ${verification.reason}`);
@@ -541,7 +555,7 @@ async function runAgent(task, rl) {
     } else {
       consecutiveFailures++;
       if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-        console.log('❌ Too many consecutive failures without progress. Stopping.');
+        console.log('Too many consecutive failures without progress. Stopping.');
         return;
       }
       messages.push({
@@ -554,7 +568,7 @@ async function runAgent(task, rl) {
     currentStateText = newStateText;
   }
 
-  console.log(`\n⏱  Reached step limit (${MAX_LOOPS}). Stopping.`);
+  console.log(`\nReached step limit (${MAX_LOOPS}). Stopping.`);
 }
 
 // ---------------------------------------------------------------------------
@@ -577,7 +591,7 @@ async function main() {
 
   console.log('');
   console.log('╔══════════════════════════════════════╗');
-  console.log('║          🌐  VeriBrowse  🔍          ║');
+  console.log('║           VeriBrowse                 ║');
   console.log('║   Verified Browser Automation Agent  ║');
   console.log('╚══════════════════════════════════════╝');
   console.log('');
@@ -591,7 +605,7 @@ async function main() {
   try {
     await runAgent(task.trim(), rl);
   } catch (err) {
-    console.error('\n💀 Fatal error:', err.message || err);
+    console.error('\nFatal error:', err.message || err);
   }
 
   rl.close();
