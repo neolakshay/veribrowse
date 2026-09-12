@@ -218,8 +218,10 @@ function actionToPlaywright(action) {
       
       if (role && href) {
         const path = href.replace(/^https?:\/\/[^\/]+/, '');
-        scriptLines.push(`let el = page.locator('${role === 'link' ? 'a' : role}[href*="${path}"]');`);
-        scriptLines.push(`if (await robustClick(el)) return;`);
+        if (path && path !== '/') {
+          scriptLines.push(`let el = page.locator('${role === 'link' ? 'a' : role}[href*="${path}"]');`);
+          scriptLines.push(`if (await robustClick(el)) return;`);
+        }
       }
       if (role) {
         scriptLines.push(`el = page.getByRole('${role}', { name: '${target}', exact: true });`);
@@ -308,6 +310,48 @@ Return strict JSON:
     return JSON.parse(response.choices[0].message.content);
   } catch {
     return { verified: false, reason: 'Failed to parse verifier response.' };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// LLM: Completion Verifier
+// ---------------------------------------------------------------------------
+
+async function verifyCompletion(task, currentStateText, plannerResult) {
+  const prompt = `You are VeriBrowse's Completion Verification Module.
+
+Your job: judge whether the USER'S ORIGINAL TASK has actually been fully COMPLETED based on the current browser state.
+
+Rules:
+- Read the original task.
+- Examine the current browser state.
+- Does the state provide strong evidence that the task is finished?
+- Example: "Find refund policy" is complete when reading the refund policy page. "Find train status" is complete when the actual status is visible on screen, NOT just the search page. "Help me sign up" is NOT complete just by reaching the signup page.
+- IMPORTANT: If the user needs to enter private information (passwords, OTP, credit cards, personal info, CAPTCHAs), the task is NOT automatically complete. The agent must use the 'human_needed' action instead of 'finish'.
+- If the completion evidence is ambiguous, return complete: false.
+
+Return strict JSON:
+{
+  "complete": true or false,
+  "reason": "one sentence explanation"
+}`;
+
+  const response = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    messages: [
+      { role: 'system', content: prompt },
+      {
+        role: 'user',
+        content: `Original Task: ${task}\n\nPlanner proposed finish with result: "${plannerResult}"\n\nCurrent Browser State:\n${currentStateText}\n\nIs the original task genuinely complete?`,
+      },
+    ],
+    response_format: { type: 'json_object' },
+  });
+
+  try {
+    return JSON.parse(response.choices[0].message.content);
+  } catch {
+    return { complete: false, reason: 'Failed to parse verifier response.' };
   }
 }
 
@@ -470,9 +514,31 @@ async function runAgent(task, rl) {
 
     // 2. Handle terminal actions
     if (action.action === 'finish') {
-      console.log(`\nTask ${action.result?.includes('could not') ? 'terminated' : 'completed'}!`);
-      console.log(`Result: ${action.result}`);
-      return;
+      if (action.result?.toLowerCase().includes('could not')) {
+        console.log(`\nTask terminated!`);
+        console.log(`Result: ${action.result}`);
+        return;
+      }
+      
+      console.log('🔎 Verifying task completion…');
+      const completion = await verifyCompletion(task, currentStateText, action.result);
+      if (completion.complete) {
+        console.log(`\n✅ Task completed!`);
+        console.log(`Result: ${action.result}`);
+        return;
+      } else {
+        console.log(`❌ COMPLETION REJECTED: ${completion.reason}`);
+        consecutiveFailures++;
+        if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+          console.log('Too many consecutive failures without progress. Stopping.');
+          return;
+        }
+        messages.push({
+          role: 'user',
+          content: `COMPLETION REJECTED.\nYou attempted to finish, but the user's task is not yet complete.\nReason: ${completion.reason}\n\nContinue browsing to complete the task, or return {"action": "human_needed", "reason": "..."} if sensitive user input or human action is required.`
+        });
+        continue;
+      }
     }
 
     if (action.action === 'human_needed') {
@@ -537,6 +603,50 @@ async function runAgent(task, rl) {
     }
 
     // 4. Translate action to Playwright
+    // 4.5 HARD SAFETY BOUNDARY: Prevent automated input of sensitive/fabricated information
+    if (action.action === 'type') {
+      const sensitiveKeywords = [
+        'email', 'e-mail', 'password', 'passcode', 'username', 'phone', 'mobile',
+        'otp', 'verification', 'code', 'captcha', 'address', 'date of birth', 'dob',
+        'card', 'credit', 'debit', 'cvv', 'cvc', 'bank', 'account', 'security answer',
+        'first name', 'last name', 'full name'
+      ];
+      const targetStr = (action.target || '').toLowerCase();
+      
+      const isSensitive = sensitiveKeywords.some(kw => targetStr.includes(kw));
+      
+      if (isSensitive) {
+        console.log(`\n==================================================`);
+        console.log(`HUMAN INTERVENTION REQUIRED`);
+        console.log(`==================================================\n`);
+        console.log(`VeriBrowse reached a sensitive input field.`);
+        console.log(`Field requires human interaction: "${action.target}"\n`);
+        console.log(`I will not invent or enter personal information.`);
+        console.log(`Please enter the required information in the browser.`);
+        console.log(`VeriBrowse has paused.\n`);
+        return;
+      }
+    } else if (action.action === 'click') {
+      const destructiveKeywords = [
+        'purchase', 'pay now', 'checkout', 'submit payment', 'confirm order', 'place order'
+      ];
+      const targetStr = (action.target || '').toLowerCase();
+      
+      const isDestructive = destructiveKeywords.some(kw => targetStr.includes(kw));
+      
+      if (isDestructive) {
+        console.log(`\n==================================================`);
+        console.log(`HUMAN INTERVENTION REQUIRED`);
+        console.log(`==================================================\n`);
+        console.log(`VeriBrowse reached a sensitive or irreversible action.`);
+        console.log(`Action requires human confirmation: "${action.target}"\n`);
+        console.log(`I will not make purchases or irreversible actions automatically.`);
+        console.log(`Please complete this step in the browser.`);
+        console.log(`VeriBrowse has paused.\n`);
+        return;
+      }
+    }
+
     const script = actionToPlaywright(action);
     if (!script) {
       console.log('Unknown action type — skipping.');
