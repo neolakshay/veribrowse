@@ -1,0 +1,12 @@
+Inference optimization research notes.
+
+Topics:
+- batching
+- caching
+- quantization
+- latency
+- throughput
+- GPU utilization
+
+Parker is currently comparing three inference configurations.
+Current bottleneck appears to be latency during large model inference.

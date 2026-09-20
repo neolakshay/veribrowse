@@ -1,0 +1,6 @@
+Parker's current learning goals:
+
+1. Build a reliable browser agent.
+2. Learn more about agentic workflows.
+3. Improve inference optimization knowledge.
+4. Contribute more to open-source projects.

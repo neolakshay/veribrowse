@@ -1,0 +1,112 @@
+[
+  {
+    "id": "task-001",
+    "title": "Finish inference benchmark",
+    "description": "Benchmark three inference test configurations for latency bottleneck",
+    "status": "in_progress",
+    "priority": "high",
+    "deadline": "Wednesday 14:00",
+    "project": "Inference Optimization",
+    "source": "emails/meeting-followup.txt",
+    "dependencies": []
+  },
+  {
+    "id": "task-002",
+    "title": "Generate inference comparison table",
+    "description": "Compare latency and throughput across the three test configurations",
+    "status": "pending",
+    "priority": "high",
+    "deadline": "Wednesday 14:00",
+    "project": "Inference Optimization",
+    "source": "emails/deadline-reminder.txt",
+    "dependencies": ["task-001"]
+  },
+  {
+    "id": "task-003",
+    "title": "Prepare engineering review summary",
+    "description": "Write short written summary for Wednesday engineering review",
+    "status": "blocked",
+    "priority": "high",
+    "deadline": "Wednesday 14:00",
+    "project": "Inference Optimization",
+    "source": "emails/meeting-followup.txt",
+    "dependencies": ["task-001", "task-002"]
+  },
+  {
+    "id": "task-004",
+    "title": "Update dashboard documentation",
+    "description": "Review evaluation metrics and update documentation before demo",
+    "status": "pending",
+    "priority": "medium",
+    "deadline": "Friday 17:00",
+    "project": "Model Evaluation Dashboard",
+    "source": "emails/project-update.txt",
+    "dependencies": []
+  },
+  {
+    "id": "task-005",
+    "title": "Ingest evaluation data",
+    "description": "Complete data ingestion pipeline for evaluation runs",
+    "status": "completed",
+    "priority": "high",
+    "deadline": "Monday 17:00",
+    "project": "Model Evaluation Dashboard",
+    "source": "documents/project-brief.txt",
+    "dependencies": []
+  },
+  {
+    "id": "task-006",
+    "title": "Complete evaluation pipeline",
+    "description": "Implement evaluation logic and model comparison backend",
+    "status": "completed",
+    "priority": "high",
+    "deadline": "Tuesday 17:00",
+    "project": "Model Evaluation Dashboard",
+    "source": "documents/project-brief.txt",
+    "dependencies": ["task-005"]
+  },
+  {
+    "id": "task-007",
+    "title": "Read recommended papers for AI Engineering Summit",
+    "description": "Prepare for Open Source AI Engineering Summit sessions",
+    "status": "pending",
+    "priority": "low",
+    "deadline": "October 14",
+    "project": "Open Source Contributions",
+    "source": "documents/conference-plan.txt",
+    "dependencies": []
+  },
+  {
+    "id": "task-008",
+    "title": "Inspect security alert email",
+    "description": "Verify Chrome on Linux sign-in notification in Gmail",
+    "status": "completed",
+    "priority": "high",
+    "deadline": "Immediate",
+    "project": "Personal Security",
+    "source": "emails/security-alert.txt",
+    "dependencies": []
+  },
+  {
+    "id": "task-009",
+    "title": "Review Hugging Face Transformers agent tool-calling release",
+    "description": "Check v4.45.0 release notes for tool-calling optimizations",
+    "status": "pending",
+    "priority": "medium",
+    "deadline": "Thursday 17:00",
+    "project": "Browser Agent Research",
+    "source": "emails/github-notification.txt",
+    "dependencies": []
+  },
+  {
+    "id": "task-010",
+    "title": "Personal browser agent architecture design",
+    "description": "Experiment with structured task extraction and local RAG",
+    "status": "in_progress",
+    "priority": "low",
+    "deadline": "Next Month",
+    "project": "Browser Agent Research",
+    "source": "notes/weekly-review.txt",
+    "dependencies": []
+  }
+]

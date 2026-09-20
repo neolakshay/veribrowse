@@ -1,0 +1,6 @@
+Hugging Face Engineering & Code Guidelines
+
+1. Clean modular Python and TypeScript code.
+2. Always write benchmark scripts for optimization claims.
+3. Document evaluation metrics thoroughly before internal demos.
+4. Ensure public repositories have clear README and tool integration instructions.

@@ -1,0 +1,12 @@
+This week's priorities:
+
+HIGH:
+- Finish inference benchmark
+- Prepare engineering review
+
+MEDIUM:
+- Update dashboard documentation
+- Read agent memory paper
+
+LOW:
+- Personal browser-agent experiments

@@ -1,0 +1,27 @@
+{
+  "name": "Parker",
+  "role": "AI/ML Engineer",
+  "company": "Hugging Face",
+  "location": "New York",
+  "timezone": "America/New_York",
+  "experience": "3 years",
+  "interests": [
+    "LLMs",
+    "agents",
+    "open-source AI",
+    "inference optimization",
+    "machine learning infrastructure",
+    "developer tools"
+  ],
+  "current_projects": [
+    "Model evaluation tooling",
+    "Internal inference optimization prototype",
+    "Personal browser-agent project"
+  ],
+  "preferred_tools": [
+    "Python",
+    "TypeScript",
+    "GitHub",
+    "Docker"
+  ]
+}

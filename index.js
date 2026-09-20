@@ -2,6 +2,8 @@ require('dotenv').config();
 const { OpenAI } = require('openai');
 const { exec } = require('child_process');
 const readline = require('readline');
+const fs = require('fs');
+const path = require('path');
 
 const SESSION_ID = process.env.WEBCMD_SESSION || 'veribrowse-3h';
 const MAX_LOOPS = 12;
@@ -40,13 +42,193 @@ Return strict JSON:
 }
 
 // ---------------------------------------------------------------------------
+// Workspace Knowledge Retrieval (Local RAG)
+// ---------------------------------------------------------------------------
+
+function getWorkspaceFiles(dirPath = path.join(__dirname, 'workspace')) {
+  let results = [];
+  if (!fs.existsSync(dirPath)) return results;
+  
+  const list = fs.readdirSync(dirPath);
+  list.forEach(file => {
+    const fullPath = path.join(dirPath, file);
+    const stat = fs.statSync(fullPath);
+    if (stat && stat.isDirectory()) {
+      results = results.concat(getWorkspaceFiles(fullPath));
+    } else {
+      if (file.endsWith('.txt') || file.endsWith('.json') || file.endsWith('.md')) {
+        const relPath = path.relative(__dirname, fullPath);
+        const content = fs.readFileSync(fullPath, 'utf8');
+        results.push({ source: relPath, content });
+      }
+    }
+  });
+  return results;
+}
+
+function retrieveWorkspaceInfo(query) {
+  const allFiles = getWorkspaceFiles();
+  if (allFiles.length === 0) return [];
+
+  const q = (query || '').toLowerCase();
+  const queryWords = q.split(/\W+/).filter(w => w.length > 2);
+
+  const scored = allFiles.map(file => {
+    const lowerContent = file.content.toLowerCase();
+    let score = 0;
+    
+    queryWords.forEach(word => {
+      if (['check', 'email', 'find', 'open', 'show', 'what', 'view', 'with', 'from', 'this', 'that'].includes(word)) return;
+      if (lowerContent.includes(word)) score += 2;
+    });
+
+    // Special category intent boosts:
+    if (file.source.includes('profile') && (q.includes('parker') || q.includes('who') || q.includes('role') || q.includes('company') || q.includes('hugging face') || q.includes('background') || q.includes('interest'))) {
+      score += 5;
+    }
+    if (file.source.includes('bookmarks') && (q.includes('bookmark') || q.includes('github') || q.includes('transformers') || q.includes('follow') || q.includes('url') || q.includes('wikipedia') || q.includes('blog') || q.includes('resource') || q.includes('huggingface'))) {
+      score += 5;
+    }
+    if ((file.source.includes('tasks') || file.source.includes('weekly-review')) && (q.includes('task') || q.includes('urgent') || q.includes('priority') || q.includes('priorities') || q.includes('todo') || q.includes('deadline') || q.includes('blocked') || q.includes('finish') || q.includes('ready'))) {
+      score += 5;
+    }
+    if (file.source.includes('projects') && (q.includes('project') || q.includes('review') || q.includes('milestone') || q.includes('summary') || q.includes('engineering review') || q.includes('inference') || q.includes('dashboard'))) {
+      score += 4;
+    }
+
+    return { ...file, score };
+  });
+
+  const matches = scored.filter(f => f.score > 0).sort((a, b) => b.score - a.score);
+  return matches.slice(0, 5);
+}
+
+// ---------------------------------------------------------------------------
+// LLM Understanding & Plan Generation Step
+// ---------------------------------------------------------------------------
+
+async function understandGoal(task, retrievedInfo) {
+  const contextText = (retrievedInfo || []).map(item => `--- SOURCE: ${item.source} ---\n${item.content}`).join('\n\n');
+
+  const prompt = `You are VeriBrowse's Goal Understanding & Workspace Intelligence Module.
+Your job is to analyze the user's goal along with the retrieved workspace information.
+
+EXTRACT AND STRUCTURE:
+1. Intent: What is the main objective of the user?
+2. Tasks: What specific tasks/steps are required to achieve this goal?
+3. Deadlines: What are the explicit deadlines mentioned in the workspace?
+4. Requirements: What deliverables/submission criteria are required?
+5. Known Information: What facts are explicitly confirmed in the workspace?
+6. Missing Information: What required details are not found in the workspace?
+7. Completed Items: Which required tasks are already marked completed?
+8. Uncertainties: Any ambiguities or potential blockers?
+9. Sources: Exact source filenames referenced.
+
+CRITICAL RULES:
+- Reason ONLY from the retrieved workspace information and user prompt.
+- Do NOT fabricate or invent information.
+- For email or web inspection tasks (e.g., checking Gmail for a login alert), focus on the user's intent to inspect their email. Do NOT invent unrelated missing information (such as company rules or credentials) unless relevant workspace files were actually retrieved.
+- If something is missing, explicitly list it under missing_information.
+
+Return strict JSON matching this schema:
+{
+  "intent": "string",
+  "tasks": ["string"],
+  "deadlines": ["string"],
+  "requirements": ["string"],
+  "known_information": ["string"],
+  "missing_information": ["string"],
+  "completed_items": ["string"],
+  "uncertainties": ["string"],
+  "sources": ["string"]
+}`;
+
+  const response = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    messages: [
+      { role: 'system', content: prompt },
+      { role: 'user', content: `User Goal: ${task}\n\nRetrieved Workspace Context:\n${contextText || '(No workspace files found)'}` }
+    ],
+    response_format: { type: 'json_object' }
+  });
+
+  try {
+    const parsed = JSON.parse(response.choices[0].message.content);
+    return {
+      intent: parsed.intent || task,
+      tasks: Array.isArray(parsed.tasks) ? parsed.tasks : [task],
+      deadlines: Array.isArray(parsed.deadlines) ? parsed.deadlines : [],
+      requirements: Array.isArray(parsed.requirements) ? parsed.requirements : [],
+      known_information: Array.isArray(parsed.known_information) ? parsed.known_information : [],
+      missing_information: Array.isArray(parsed.missing_information) ? parsed.missing_information : [],
+      completed_items: Array.isArray(parsed.completed_items) ? parsed.completed_items : [],
+      uncertainties: Array.isArray(parsed.uncertainties) ? parsed.uncertainties : [],
+      sources: Array.isArray(parsed.sources) ? parsed.sources : retrievedInfo.map(r => r.source)
+    };
+  } catch (e) {
+    return {
+      intent: task,
+      tasks: [task],
+      deadlines: [],
+      requirements: [],
+      known_information: [],
+      missing_information: [],
+      completed_items: [],
+      uncertainties: [],
+      sources: (retrievedInfo || []).map(r => r.source)
+    };
+  }
+}
+
+async function generatePlan(task, understanding) {
+  const prompt = `You are VeriBrowse's Strategic Planner.
+Based on the user goal and the structured understanding, generate a concise, actionable 4 to 6 step plan.
+
+Rules:
+- The plan must be specific to the extracted requirements and deadlines.
+- Clearly state the sequence: review requirements -> verify completed items -> launch/open required URL -> perform required browser action -> verify completion.
+
+Return strict JSON:
+{
+  "steps": ["Step 1: ...", "Step 2: ...", "Step 3: ...", "Step 4: ..."]
+}`;
+
+  const response = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    messages: [
+      { role: 'system', content: prompt },
+      { role: 'user', content: `User Goal: ${task}\n\nStructured Understanding:\n${JSON.stringify(understanding, null, 2)}` }
+    ],
+    response_format: { type: 'json_object' }
+  });
+
+  try {
+    const parsed = JSON.parse(response.choices[0].message.content);
+    return Array.isArray(parsed.steps) ? parsed.steps : [];
+  } catch (e) {
+    return [
+      "1. Review extracted workspace details and submission requirements.",
+      "2. Check completed prerequisite tasks.",
+      "3. Open the target web page in browser.",
+      "4. Verify page state and report result."
+    ];
+  }
+}
+
+
+// ---------------------------------------------------------------------------
 // WebCMD CLI helpers
 // ---------------------------------------------------------------------------
 
 function runWebCmd(command, stdinData = null) {
   return new Promise((resolve, reject) => {
+    const env = { ...process.env };
+    if (process.env.BROWSER === 'chrome') {
+      const port = process.env.CHROME_DEBUG_PORT || '9222';
+      env.WEBCMD_CDP_ENDPOINT = `http://127.0.0.1:${port}`;
+    }
     const fullCmd = `webcmd --session ${SESSION_ID} browser ${command} --format json`;
-    const child = exec(fullCmd, { maxBuffer: 1024 * 1024 * 10, timeout: 30000 }, (error, stdout, stderr) => {
+    const child = exec(fullCmd, { env, maxBuffer: 1024 * 1024 * 10, timeout: 30000 }, (error, stdout, stderr) => {
       if (stdout) {
         try {
           resolve(JSON.parse(stdout));
@@ -244,24 +426,43 @@ function actionToPlaywright(action) {
     }
     case 'click': {
       const target = escapeJS(action.target || '');
+      const ref = action.ref ? escapeJS(action.ref) : null;
       const role = action.role ? escapeJS(action.role) : null;
       const href = action.href ? escapeJS(action.href) : null;
       
+      // Extract key terms for partial matching if target is long/comma-separated
+      let searchTerms = [target];
+      if (target.includes(',') || target.length > 20) {
+        const parts = target.split(',').map(s => s.trim()).filter(s => s.length > 3);
+        if (parts.length > 0) {
+          searchTerms = parts.concat(searchTerms);
+        }
+      }
+
       const scriptLines = [
+        `let el;`,
         `async function robustClick(loc) {`,
-        `  if (await loc.count() === 0) return false;`,
-        `  try { await loc.first().click({ timeout: 3000 }); return true; }`,
+        `  if (!loc || await loc.count() === 0) return false;`,
+        `  try { await loc.first().click({ timeout: 4000 }); return true; }`,
         `  catch(e) {`,
-        `    try { await loc.first().dispatchEvent('click', { timeout: 2000 }); return true; }`,
-        `    catch(e2) { return false; }`,
+        `    try { await loc.first().click({ force: true, timeout: 3000 }); return true; }`,
+        `    catch(e1) {`,
+        `      try { await loc.first().dispatchEvent('click', { timeout: 2000 }); return true; }`,
+        `      catch(e2) { return false; }`,
+        `    }`,
         `  }`,
         `}`
       ];
       
+      if (ref) {
+        scriptLines.push(`el = page.locator('[data-ref="${ref}"], [ref="${ref}"], #${ref}');`);
+        scriptLines.push(`if (await robustClick(el)) return;`);
+      }
+
       if (role && href) {
         const path = href.replace(/^https?:\/\/[^\/]+/, '');
         if (path && path !== '/') {
-          scriptLines.push(`let el = page.locator('${role === 'link' ? 'a' : role}[href*="${path}"]');`);
+          scriptLines.push(`el = page.locator('${role === 'link' ? 'a' : role}[href*="${path}"], [href*="${path}"]');`);
           scriptLines.push(`if (await robustClick(el)) return;`);
         }
       }
@@ -271,43 +472,72 @@ function actionToPlaywright(action) {
         scriptLines.push(`el = page.getByRole('${role}', { name: '${target}' });`);
         scriptLines.push(`if (await robustClick(el)) return;`);
       }
-      scriptLines.push(`el = page.getByText('${target}');`);
+
+      scriptLines.push(`el = page.getByText('${target}', { exact: true });`);
       scriptLines.push(`if (await robustClick(el)) return;`);
+      scriptLines.push(`el = page.getByText('${target}', { exact: false });`);
+      scriptLines.push(`if (await robustClick(el)) return;`);
+
+      // Partial term & Gmail/row element cascade
+      for (const term of searchTerms) {
+        const safeTerm = escapeJS(term);
+        if (!safeTerm) continue;
+        scriptLines.push(`el = page.locator('tr, [role="row"], [role="link"], [role="option"], [role="button"], div.y6, span.bog, div.zA, span.bAq').filter({ hasText: '${safeTerm}' });`);
+        scriptLines.push(`if (await robustClick(el)) return;`);
+        scriptLines.push(`el = page.getByText('${safeTerm}', { exact: false });`);
+        scriptLines.push(`if (await robustClick(el)) return;`);
+      }
+
       scriptLines.push(`throw new Error('Element not found or not clickable');`);
-      
       return `await (async () => {\n  ${scriptLines.join('\n  ')}\n})();`;
     }
     case 'type': {
       const target = escapeJS(action.target || '');
       const text = escapeJS(action.text || '');
+      const ref = action.ref ? escapeJS(action.ref) : null;
       const role = action.role ? escapeJS(action.role) : null;
       
       const scriptLines = [
+        `let el;`,
         `async function robustFill(loc, text) {`,
-        `  if (await loc.count() === 0) return false;`,
-        `  try { await loc.first().fill(text, { timeout: 3000 }); return true; }`,
-        `  catch(e) {`,
-        `    try { await loc.first().dispatchEvent('focus'); await loc.first().fill(text, { force: true, timeout: 2000 }); return true; }`,
-        `    catch(e2) { return false; }`,
+        `  if (!loc || await loc.count() === 0) return false;`,
+        `  try {`,
+        `    await loc.first().fill(text, { timeout: 3000 });`,
+        `    await loc.first().press('Enter').catch(() => {});`,
+        `    return true;`,
+        `  } catch(e) {`,
+        `    try {`,
+        `      await loc.first().dispatchEvent('focus');`,
+        `      await loc.first().fill(text, { force: true, timeout: 2000 });`,
+        `      await loc.first().press('Enter').catch(() => {});`,
+        `      return true;`,
+        `    } catch(e2) { return false; }`,
         `  }`,
         `}`
       ];
       
+      if (ref) {
+        scriptLines.push(`el = page.locator('[data-ref="${ref}"], [ref="${ref}"], #${ref}');`);
+        scriptLines.push(`if (await robustFill(el, '${text}')) return;`);
+      }
       if (role) {
-        scriptLines.push(`let el = page.getByRole('${role}', { name: '${target}', exact: true });`);
+        scriptLines.push(`el = page.getByRole('${role}', { name: '${target}', exact: true });`);
         scriptLines.push(`if (await robustFill(el, '${text}')) return;`);
         scriptLines.push(`el = page.getByRole('${role}', { name: '${target}' });`);
         scriptLines.push(`if (await robustFill(el, '${text}')) return;`);
       }
       scriptLines.push(`el = page.getByPlaceholder('${target}');`);
       scriptLines.push(`if (await robustFill(el, '${text}')) return;`);
+      scriptLines.push(`el = page.getByLabel('${target}', { exact: false });`);
+      scriptLines.push(`if (await robustFill(el, '${text}')) return;`);
+      scriptLines.push(`el = page.locator('input[aria-label*="Search"], input[name="q"], input[type="text"], [contenteditable="true"]');`);
+      scriptLines.push(`if (await robustFill(el, '${text}')) return;`);
       scriptLines.push(`throw new Error('Field not found or not fillable');`);
 
       return `await (async () => {\n  ${scriptLines.join('\n  ')}\n})();`;
     }
     case 'extract':
-      // Use the snapshot read mode instead of raw innerText
-      return null; // handled separately
+      return null;
     case 'wait':
       return `await page.waitForTimeout(${Math.min(Number(action.ms) || 2000, 5000)});`;
     default:
@@ -328,6 +558,7 @@ Rules:
 - Do NOT just check if the command ran without error.
 - Inspect the new browser state and compare it with the previous state.
 - Ask: "Is the user closer to their goal than before?"
+- IMPORTANT: If the action was 'navigate' to a URL (e.g. Gmail) and the page is ALREADY on that site/inbox, treat this as VERIFIED SUCCESS with reason "page already satisfies navigation requirement".
 - If a CAPTCHA or human-verification challenge appeared, set verified to false and mention it.
 
 Return strict JSON:
@@ -368,8 +599,15 @@ Rules:
 - Read the original task.
 - Examine the current browser state.
 - Does the state provide strong evidence that the task is finished?
-- Example: "Find refund policy" is complete when reading the refund policy page. "Find train status" is complete when the actual status is visible on screen, NOT just the search page. "Help me sign up" is NOT complete just by reaching the signup page.
-- IMPORTANT: If the user needs to enter private information (passwords, OTP, credit cards, personal info, CAPTCHAs), the task is NOT automatically complete. The agent must use the 'human_needed' action instead of 'finish'.
+- For email inspection tasks (e.g. "check my email for a login alert"):
+  Completion requires:
+  1. Gmail/inbox is accessible.
+  2. A relevant email was found.
+  3. The relevant email was opened and its contents inspected on screen.
+  4. Relevant information (sender, subject, time, alert details) was extracted and reported to the user.
+  - Simply navigating to Gmail or displaying an inbox is NOT complete.
+  - If no matching email exists after searching, report that clearly as the result.
+- IMPORTANT: If private credentials or security settings changes are needed, use 'human_needed'.
 - If the completion evidence is ambiguous, return complete: false.
 
 Return strict JSON:
@@ -409,15 +647,25 @@ You must return ONE structured JSON action to progress toward the goal.
 CRITICAL RULES:
 1. Every action MUST be grounded in elements visible in the current snapshot.
 2. Do NOT invent URLs. Use "navigate" ONLY if the user explicitly gave a URL AND you are not there yet.
-3. Prefer "click" on links/buttons already in the snapshot for navigation.
-4. Use "type" to fill input fields, search boxes, or text areas visible in the snapshot.
-5. Use "extract" only when you need to read the page content to answer the user's task. You MUST explicitly specify exactly what fields you need in the "what" property (e.g. "exact current location, current delay, next station"). Do NOT guess or fabricate missing values.
-6. Use "wait" if a page is loading or you just submitted a form.
-7. If a CAPTCHA, "verify you are human", or similar challenge is visible, return:
+3. If the browser is ALREADY on Gmail, Inbox, or mail.google.com, Gmail is open! NEVER issue "navigate" to gmail.com or mail.google.com when already on Gmail.
+4. GMAIL & EMAIL WORKFLOW:
+   - For email requests ("check my email for a login alert"), reason semantically. Relevant terms include: "security alert", "login alert", "new sign-in", "sign-in", "suspicious login", "account activity".
+   - Inspect visible inbox items first. If a matching email is visible, click its text/subject fragment (e.g. target "Security alert" or "New sign-in").
+   - Do NOT copy the full long multi-line text of an email row as the target. Use a short distinctive subject fragment.
+   - If the email is not visible, use Gmail's search box to search for "login alert" or "security alert" instead of refreshing or re-navigating.
+   - Once an email is opened, inspect/extract visible details: sender, subject, date/time, device/browser, approximate location, security actions.
+5. EMAIL SECURITY CONSTRAINTS:
+   - You MAY: inspect inbox, search emails, open an email, extract email text.
+   - You MUST NOT: enter passwords, enter OTPs, change account settings, delete emails, mark spam, click suspicious links, perform recovery, or send emails.
+   - If an email contains suspicious links, report them in the final result rather than clicking them.
+6. Use "type" to fill input fields, search boxes, or text areas visible in the snapshot.
+7. Use "extract" only when you need to read the page content to answer the user's task.
+8. Use "wait" if a page is loading or you just submitted a form.
+9. If a CAPTCHA, "verify you are human", or similar challenge is visible, return:
    {"action": "human_needed", "reason": "CAPTCHA or verification challenge detected."}
-8. If the current page has NO plausible path toward the goal, return:
+10. If the current page has NO plausible path toward the goal, return:
    {"action": "finish", "result": "I could not find a verified path to complete the task from the current page."}
-9. When the task is complete and you can answer the user, return:
+11. When the task is complete and you can answer the user, return:
    {"action": "finish", "result": "your answer here"}
 
 FAILURE HANDLING:
@@ -464,14 +712,62 @@ async function runAgent(task, options = {}) {
   console.log(`\nStarting task: "${task}"\n`);
   emit({ type: 'task_started', task });
   
+  // 1. Search local workspace knowledge
+  console.log('Searching local workspace knowledge…');
+  const retrievedInfo = retrieveWorkspaceInfo(task);
+  const sources = retrievedInfo.map(r => r.source);
+  if (retrievedInfo.length > 0) {
+    console.log(`  Found ${retrievedInfo.length} workspace sources: ${sources.join(', ')}`);
+    emit({ type: 'workspace_retrieved', sources, count: retrievedInfo.length });
+  }
+
+  // 2. LLM Understanding Step
+  console.log('Extracting tasks, deadlines, and requirements via LLM understanding…');
+  emit({ type: 'understanding_started' });
+  const understanding = await understandGoal(task, retrievedInfo);
+  console.log(`  Intent: ${understanding.intent}`);
+  console.log(`  Requirements: ${understanding.requirements.join(', ')}`);
+  console.log(`  Deadlines: ${understanding.deadlines.join(', ')}`);
+  emit({ type: 'understanding', understanding });
+
+  // 3. Plan Generation Step
+  console.log('Generating actionable plan…');
+  const planSteps = await generatePlan(task, understanding);
+  console.log(`  Plan (${planSteps.length} steps):\n   ${planSteps.join('\n   ')}`);
+  emit({ type: 'plan_generated', plan: planSteps, understanding });
+
+  // 4. Extract domain constraints
   console.log('Extracting target domain constraints…');
-  const targetDomain = await extractTargetDomain(task);
+  let targetDomain = await extractTargetDomain(task);
+  if (!targetDomain && understanding) {
+    const combinedStr = (understanding.known_information || []).concat(understanding.requirements || []).concat(understanding.tasks || []).join(' ');
+    const urlMatch = combinedStr.match(/https?:\/\/[^\s]+/);
+    if (urlMatch) {
+      try {
+        targetDomain = new URL(urlMatch[0]).hostname;
+      } catch (e) {}
+    }
+  }
+
   if (targetDomain) {
     console.log(`  Target constraint: ${targetDomain}`);
     emit({ type: 'domain_constraint', domain: targetDomain });
   }
 
-  const messages = [{ role: 'system', content: PLANNER_SYSTEM_PROMPT }];
+  const contextSummary = `
+PRODUCTIVITY CONTEXT FROM WORKSPACE:
+- Intent: ${understanding.intent || task}
+- Extracted Requirements: ${JSON.stringify(understanding.requirements || [])}
+- Extracted Deadlines: ${JSON.stringify(understanding.deadlines || [])}
+- Completed Prerequisites: ${JSON.stringify(understanding.completed_items || [])}
+- Execution Plan: ${JSON.stringify(planSteps)}
+- Sources Referenced: ${(understanding.sources || []).join(', ')}
+`;
+
+  const messages = [
+    { role: 'system', content: PLANNER_SYSTEM_PROMPT + '\n\n' + contextSummary }
+  ];
+
   let currentState, currentStateText;
   let consecutiveFailures = 0;
   const MAX_CONSECUTIVE_FAILURES = 3;
@@ -489,7 +785,8 @@ async function runAgent(task, options = {}) {
 
   // --- Startup navigation if on about:blank ---
   if (currentState?.page?.url === 'about:blank' || currentState?.page?.url === 'chrome://newtab/') {
-    const urlMatch = task.match(/https?:\/\/[^\s]+/);
+    const combinedText = task + ' ' + JSON.stringify(understanding);
+    const urlMatch = combinedText.match(/https?:\/\/[^\s]+/);
     const startUrl = urlMatch ? urlMatch[0] : 'https://www.google.com';
     console.log(`Initializing empty browser to starting URL: ${startUrl}`);
     try {
@@ -543,6 +840,25 @@ async function runAgent(task, options = {}) {
     console.log(`Action: ${JSON.stringify(action)}`);
     emit({ type: 'action', action });
     messages.push({ role: 'assistant', content: JSON.stringify(action) });
+
+    // Intercept redundant navigation to Gmail if already on Gmail
+    if (action.action === 'navigate') {
+      const navUrl = (action.url || '').toLowerCase();
+      const currentUrl = (currentState?.page?.url || '').toLowerCase();
+      const isGmailNav = navUrl.includes('gmail.com') || navUrl.includes('mail.google.com');
+      const isAlreadyOnGmail = currentUrl.includes('gmail.com') || currentUrl.includes('mail.google.com') || currentStateText.includes('Inbox') || currentStateText.includes('Gmail');
+      
+      if (isGmailNav && isAlreadyOnGmail) {
+        console.log('⚡ Browser is ALREADY on Gmail inbox. Skipping redundant navigation.');
+        emit({ type: 'action_success', reason: 'Page already satisfies navigation requirement' });
+        messages.push({
+          role: 'user',
+          content: `NAVIGATION SATISFIED: You are ALREADY on Gmail/Inbox (${currentState?.page?.url}). Do NOT navigate to gmail.com again. Inspect visible inbox emails directly or use the search box.`
+        });
+        consecutiveFailures = 0;
+        continue;
+      }
+    }
 
     // Prevent repeating a failed action on the same page
     if (action.action !== 'finish' && action.action !== 'human_needed' && action.action !== 'extract') {

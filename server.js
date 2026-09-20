@@ -85,6 +85,17 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (req.method === 'POST' && req.url === '/api/stop') {
+    if (pendingAskUserResolve) {
+      pendingAskUserResolve('quit');
+      pendingAskUserResolve = null;
+    }
+    broadcast({ type: 'terminated', result: 'Task stopped by user.' });
+    activeTask = null;
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ status: 'stopped' }));
+  }
+
   // Serve static files
   let filePath = path.join(__dirname, 'public', req.url === '/' ? 'index.html' : req.url);
   const ext = path.extname(filePath);

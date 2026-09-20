@@ -1,0 +1,19 @@
+AI Day Hackathon Official Rules & Submission Guidelines
+
+1. Overview:
+   All teams must submit their final project details through the submission portal before the strict deadline.
+
+2. Official Submission Page:
+   URL: https://devpost.com
+
+3. Requirements Checklist:
+   - GitHub Repository (Must be public and include full code)
+   - Project Description (Minimum 200 words covering features & verification)
+   - Live Demo Link (Working application or demo environment)
+   - Presentation Deck (PDF or Google Slides link)
+
+4. Strict Deadline:
+   20 September 2026, 6:00 PM IST (Late submissions will not be accepted)
+
+5. Human Verification:
+   The submission requires human confirmation before final submission to prevent accidental incomplete entries.

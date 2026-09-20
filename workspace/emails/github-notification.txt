@@ -1,0 +1,11 @@
+Subject: GitHub Notification: Hugging Face Transformers Repo Update
+
+Hi Parker,
+
+A new release (v4.45.0) and new discussions were created in the huggingface/transformers repository regarding agent tool-calling optimizations and model inference efficiency.
+
+Repository:
+https://github.com/huggingface/transformers
+
+Action:
+Review release notes and test compatibility with internal inference optimization benchmarks.

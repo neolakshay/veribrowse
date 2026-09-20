@@ -1,0 +1,5 @@
+Ideas:
+- Build an agent that turns emails into actionable workflows.
+- Explore browser-based tool execution.
+- Build better verification mechanisms for AI agents.
+- Experiment with structured task extraction.

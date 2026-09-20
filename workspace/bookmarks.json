@@ -1,0 +1,80 @@
+{
+  "bookmarks": [
+    {
+      "name": "Hugging Face Main Hub",
+      "url": "https://huggingface.co/",
+      "category": "Platform"
+    },
+    {
+      "name": "Hugging Face Transformers Repository",
+      "url": "https://github.com/huggingface/transformers",
+      "category": "GitHub"
+    },
+    {
+      "name": "Hugging Face Diffusers Repository",
+      "url": "https://github.com/huggingface/diffusers",
+      "category": "GitHub"
+    },
+    {
+      "name": "Hugging Face Datasets Repository",
+      "url": "https://github.com/huggingface/datasets",
+      "category": "GitHub"
+    },
+    {
+      "name": "Hugging Face TRL Repository",
+      "url": "https://github.com/huggingface/trl",
+      "category": "GitHub"
+    },
+    {
+      "name": "Hugging Face LeRobot Repository",
+      "url": "https://github.com/huggingface/lerobot",
+      "category": "GitHub"
+    },
+    {
+      "name": "Wikipedia - Transformer Model",
+      "url": "https://en.wikipedia.org/wiki/Transformer_(deep_learning_architecture)",
+      "category": "Research"
+    },
+    {
+      "name": "Python Documentation",
+      "url": "https://docs.python.org/3/",
+      "category": "Documentation"
+    },
+    {
+      "name": "Docker Documentation",
+      "url": "https://docs.docker.com/",
+      "category": "Documentation"
+    },
+    {
+      "name": "GitHub Documentation",
+      "url": "https://docs.github.com/",
+      "category": "Documentation"
+    }
+  ],
+  "followed_sources": [
+    {
+      "name": "Hugging Face Blog",
+      "url": "https://huggingface.co/blog",
+      "category": "AI"
+    },
+    {
+      "name": "Hugging Face GitHub Releases",
+      "url": "https://github.com/huggingface/transformers/releases",
+      "category": "Open Source"
+    },
+    {
+      "name": "PyTorch Blog",
+      "url": "https://pytorch.org/blog/",
+      "category": "Infrastructure"
+    }
+  ],
+  "knowledge_interests": [
+    "Transformer",
+    "Large language model",
+    "Retrieval-augmented generation",
+    "Reinforcement learning from human feedback",
+    "Compiler",
+    "Distributed computing",
+    "GPU computing"
+  ]
+}

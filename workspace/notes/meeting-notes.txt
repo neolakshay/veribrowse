@@ -1,0 +1,8 @@
+Inference optimization meeting:
+
+Current bottleneck appears to be latency during large model inference.
+
+Need:
+- benchmark
+- compare configurations
+- document findings

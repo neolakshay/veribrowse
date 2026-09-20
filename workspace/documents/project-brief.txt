@@ -1,0 +1,14 @@
+Project:
+Model Evaluation Dashboard
+
+Goal:
+Provide engineers with a simple interface for comparing model evaluation runs.
+
+Status:
+Data ingestion - complete
+Evaluation pipeline - complete
+Dashboard - in progress
+Documentation - pending
+
+Next milestone:
+Internal demo on Friday.

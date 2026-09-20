@@ -1,0 +1,23 @@
+Subject: AI Day Hackathon Submission Instructions
+
+Hi Team,
+
+Here are the critical details for our AI Day Hackathon submission:
+
+Submission Requirements:
+1. Public GitHub repository containing the complete source code and README.
+2. Project description highlighting problem statement, architecture, and verification engine.
+3. Live demo link or video walkthrough.
+4. Final presentation slides.
+
+Submission Portal:
+Submit the project via the official submission portal at:
+https://devpost.com
+
+Submission Deadline:
+20 September, 6:00 PM IST
+
+Please ensure all completed items are verified before opening the submission page.
+
+Best regards,
+Hackathon Organizing Team

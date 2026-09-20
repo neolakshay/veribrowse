@@ -1,45 +1,324 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
   <meta charset="UTF-8">
-  <title>VeriBrowse</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VeriBrowse — AI Agent Control Center</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+    rel="stylesheet">
   <link rel="stylesheet" href="style.css">
 </head>
+
 <body>
-  <div class="container">
-    <header>
-      <h1>VeriBrowse</h1>
-      <p>Verified Browser Automation</p>
+  <div class="app-container">
+
+    <!-- Top Header / Hero -->
+    <header class="app-header">
+      <div class="header-top">
+        <div class="brand">
+          <div class="brand-logo">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+              stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+              <path d="M9 12l2 2 4-4" />
+            </svg>
+          </div>
+          <div class="brand-text">
+            <h1 class="brand-title">VeriBrowse</h1>
+          </div>
+        </div>
+        <div class="badge-ps2">
+          <span class="badge-dot"></span>
+          PS2 · Real-World Productivity
+        </div>
+      </div>
+      <p class="hero-subtitle">AI agent that browses, verifies, and knows when to stop.</p>
     </header>
 
-    <main>
-      <div class="input-section">
-        <label for="taskInput">What do you want me to do?</label>
-        <textarea id="taskInput" rows="3" placeholder="Find the refund page on Skyscanner"></textarea>
-        <button id="runBtn">Run</button>
-      </div>
-
-      <div class="status-section" id="statusSection" style="display:none;">
-        <div class="status-header">
-          <span id="currentStatusLabel" class="status-badge">Starting...</span>
+    <!-- Compact Workspace Context Card -->
+    <section class="workspace-profile-card">
+      <div class="profile-header">
+        <div class="profile-avatar">P</div>
+        <div class="profile-info">
+          <div class="profile-name">Parker <span class="profile-badge">Hugging Face · Synthetic Profile</span></div>
+          <div class="profile-role">AI/ML Engineer · New York</div>
         </div>
-        <div id="logArea" class="log-area"></div>
       </div>
+      <div class="profile-grid">
+        <div class="profile-stat">
+          <span class="stat-label">Current focus</span>
+          <span class="stat-value accent">Inference Optimization</span>
+        </div>
+        <div class="profile-stat">
+          <span class="stat-label">Upcoming</span>
+          <span class="stat-value">Engineering Review · Wed 2 PM</span>
+        </div>
+        <div class="profile-stat">
+          <span class="stat-label">Open tasks</span>
+          <span class="stat-value" id="openTasksCount">6 Active Tasks</span>
+        </div>
+        <div class="profile-stat">
+          <span class="stat-label">Retrieved sources</span>
+          <span class="stat-value" id="retrievedSourcesCount">Local Workspace</span>
+        </div>
+      </div>
+    </section>
 
-      <div class="intervention-section" id="interventionSection" style="display:none;">
-        <h3>HUMAN INTERVENTION REQUIRED</h3>
-        <p id="interventionReason"></p>
-        <p>VeriBrowse will not invent or enter this data. Please complete the required action in the browser.</p>
-        <button id="continueBtn">Continue</button>
-        <button id="stopBtn" class="danger">Stop Agent</button>
+    <!-- Task Input Section -->
+    <section class="task-card">
+      <div class="task-card-header">
+        <label for="taskInput" class="task-label">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10" />
+            <line x1="12" y1="16" x2="12" y2="12" />
+            <line x1="12" y1="8" x2="12.01" y2="8" />
+          </svg>
+          Target Task Instruction
+        </label>
       </div>
+      <div class="textarea-wrapper">
+        <textarea id="taskInput" rows="3"
+          placeholder="Describe what you want VeriBrowse to browse and verify..."></textarea>
+      </div>
+      <div class="task-actions">
+        <button id="demoBtn" class="btn-demo" type="button">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+            stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+          </svg>
+          Try demo
+        </button>
+        <div class="run-stop-group">
+          <button id="runBtn" class="btn-run" type="button">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+              stroke-linecap="round" stroke-linejoin="round">
+              <polygon points="5 3 19 12 5 21 5 3" />
+            </svg>
+            <span>Run Agent</span>
+          </button>
+          <button id="stopTaskBtn" class="btn-stop-main" type="button" style="display: none;">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+              stroke-linecap="round" stroke-linejoin="round">
+              <rect x="6" y="6" width="12" height="12" />
+            </svg>
+            <span>Stop Agent</span>
+          </button>
+        </div>
+      </div>
+    </section>
 
-      <div class="result-section" id="resultSection" style="display:none;">
-        <h3>VERIFIED RESULT</h3>
-        <p id="resultText"></p>
+    <!-- Agent Pipeline Stage Bar -->
+    <section class="pipeline-section">
+      <div class="pipeline-header">
+        <span class="pipeline-title">AGENT PIPELINE</span>
+        <span id="currentStepIndicator" class="step-indicator">IDLE</span>
       </div>
+      <div class="pipeline-steps">
+        <div class="pipeline-step" id="step-understand">
+          <div class="step-badge">1</div>
+          <div class="step-label">UNDERSTAND</div>
+        </div>
+        <div class="pipeline-connector"></div>
+        <div class="pipeline-step" id="step-plan">
+          <div class="step-badge">2</div>
+          <div class="step-label">PLAN</div>
+        </div>
+        <div class="pipeline-connector"></div>
+        <div class="pipeline-step" id="step-act">
+          <div class="step-badge">3</div>
+          <div class="step-label">ACT</div>
+        </div>
+        <div class="pipeline-connector"></div>
+        <div class="pipeline-step" id="step-verify">
+          <div class="step-badge">4</div>
+          <div class="step-label">VERIFY</div>
+        </div>
+        <div class="pipeline-connector"></div>
+        <div class="pipeline-step" id="step-complete">
+          <div class="step-badge">5</div>
+          <div class="step-label">COMPLETE</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Main Output & Control Area -->
+    <main class="control-center">
+
+      <!-- Live Activity Feed Container -->
+      <section class="activity-section" id="activitySection">
+        <div class="activity-header">
+          <div class="activity-title-group">
+            <span class="pulse-indicator" id="pulseIndicator"></span>
+            <h2>Live Activity Timeline</h2>
+          </div>
+          <div class="activity-meta">
+            <button id="toggleDevDetailsBtn" class="btn-dev-toggle" type="button">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                stroke-linecap="round" stroke-linejoin="round">
+                <path
+                  d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
+              </svg>
+              <span>Show technical details</span>
+            </button>
+            <span id="timerBadge" class="timer-badge">00:00</span>
+            <span id="statusBadge" class="status-badge ready">READY</span>
+          </div>
+        </div>
+
+        <!-- Human Intervention Banner -->
+        <div class="intervention-card" id="interventionSection" style="display: none;">
+          <div class="intervention-header">
+            <div class="intervention-icon">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                stroke-linecap="round" stroke-linejoin="round">
+                <path
+                  d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+              </svg>
+            </div>
+            <div>
+              <h3 class="intervention-title">Human Approval Required</h3>
+              <p class="intervention-subtitle">VeriBrowse will not enter sensitive information or perform irreversible
+                actions without you.</p>
+            </div>
+          </div>
+          <div class="intervention-body">
+            <div class="intervention-reason-box">
+              <span class="reason-label">Action required:</span>
+              <p id="interventionReason" class="intervention-reason-text"></p>
+            </div>
+          </div>
+          <div class="intervention-actions">
+            <button id="continueBtn" class="btn-continue" type="button">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="20 6 9 17 4 12" />
+              </svg>
+              Continue Execution
+            </button>
+            <button id="stopBtn" class="btn-stop" type="button">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                stroke-linecap="round" stroke-linejoin="round">
+                <rect x="6" y="6" width="12" height="12" />
+              </svg>
+              Stop Agent
+            </button>
+          </div>
+        </div>
+
+        <!-- Checkpoint & Recovery Card -->
+        <div class="recovery-card" id="recoverySection" style="display: none;">
+          <div class="recovery-header">
+            <div class="recovery-icon">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <circle cx="12" cy="12" r="10"/>
+                <line x1="10" y1="15" x2="10" y2="9"/>
+                <line x1="14" y1="15" x2="14" y2="9"/>
+              </svg>
+            </div>
+            <div>
+              <h3 class="recovery-title">VeriBrowse Paused Safely</h3>
+              <p class="recovery-subtitle" id="recoverySubtitle">Verified progress saved in local checkpoint.</p>
+            </div>
+          </div>
+          <div class="recovery-body">
+            <div class="recovery-meta-box">
+              <div class="recovery-stat">
+                <span class="stat-label">Reason</span>
+                <span id="recoveryReason" class="stat-value">Task paused safely</span>
+              </div>
+              <div class="recovery-stat">
+                <span class="stat-label">Step State</span>
+                <span id="recoveryStepState" class="stat-value">Step -- / 12</span>
+              </div>
+            </div>
+            <div class="recovery-progress-box">
+              <h4 class="recovery-list-title">Last Verified Progress:</h4>
+              <ul id="verifiedStepsList" class="verified-steps-list">
+                <li>No verified steps yet.</li>
+              </ul>
+            </div>
+            <div id="checkStateStatus" class="check-state-result" style="display: none;"></div>
+          </div>
+          <div class="recovery-actions">
+            <button id="checkStateBtn" class="btn-recovery-secondary" type="button">
+              🔍 Check Current State
+            </button>
+            <button id="resumeBtn" class="btn-recovery-primary" type="button">
+              ▶ Resume from Checkpoint
+            </button>
+            <button id="startFreshBtn" class="btn-recovery-secondary" type="button">
+              🔄 Start Fresh
+            </button>
+            <button id="stopRecoveryBtn" class="btn-recovery-danger" type="button">
+              ⏹ Stop
+            </button>
+          </div>
+        </div>
+
+        <!-- Final Result Card -->
+        <div class="result-card" id="resultSection" style="display: none;">
+          <div class="result-header">
+            <div class="result-icon-box">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+                stroke-linecap="round" stroke-linejoin="round">
+                <path d="M22 11.08V12a10 10 0 1 1-5.93-9.14" />
+                <polyline points="22 4 12 14.01 9 11.01" />
+              </svg>
+            </div>
+            <div>
+              <h3 class="result-title">Task Verified Successfully</h3>
+              <span class="result-subtitle">Result verified against prompt goal</span>
+            </div>
+          </div>
+          <div class="result-body">
+            <div class="result-text-box">
+              <span class="result-label">Final Outcome</span>
+              <p id="resultText" class="result-text"></p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Empty Feed Placeholder -->
+        <div class="empty-feed" id="emptyFeed">
+          <div class="empty-icon">
+            <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"
+              stroke-linecap="round" stroke-linejoin="round">
+              <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
+              <line x1="8" y1="21" x2="16" y2="21" />
+              <line x1="12" y1="17" x2="12" y2="21" />
+            </svg>
+          </div>
+          <h4>Agent Control Center Ready</h4>
+          <p>Submit a natural-language task prompt or click "Try demo" to execute the VeriBrowse engine with real-time
+            verification.</p>
+        </div>
+
+        <!-- Timeline Container -->
+        <div class="timeline-container" id="logArea" style="display: none;">
+          <!-- Timeline items inserted dynamically -->
+        </div>
+
+      </section>
     </main>
+
+    <footer class="app-footer">
+      <div class="footer-left">
+        <span class="footer-brand">VeriBrowse</span>
+        <span class="footer-divider">•</span>
+        <span>Automation Engine</span>
+      </div>
+      <div class="footer-right">
+        <span class="footer-status-indicator"></span> System Active
+      </div>
+    </footer>
+
   </div>
   <script src="app.js"></script>
 </body>
+
 </html>

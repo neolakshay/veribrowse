@@ -1,0 +1,14 @@
+Subject: Security Alert - New Sign-in
+
+A new sign-in to Parker's account was detected.
+
+Time:
+2:07 PM
+
+Location:
+New York, United States
+
+Device:
+Chrome on Linux
+
+If this was not you, review your account security settings.

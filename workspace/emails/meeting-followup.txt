@@ -1,0 +1,11 @@
+Subject: Follow-up: Inference Optimization Meeting
+
+Hi Parker,
+
+Following today's discussion:
+
+1. Benchmark the current inference pipeline.
+2. Compare latency across the three test configurations.
+3. Prepare a short summary for next week's engineering review.
+
+The engineering review is scheduled for Wednesday at 2 PM.

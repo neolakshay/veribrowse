@@ -1,0 +1,42 @@
+[
+  {
+    "id": "proj-001",
+    "name": "Model Evaluation Dashboard",
+    "description": "Provide engineers with a simple interface for comparing model evaluation runs",
+    "status": "in_progress",
+    "next_milestone": "Internal demo on Friday",
+    "current_tasks": ["Update dashboard documentation"],
+    "related_documents": ["documents/project-brief.txt"],
+    "related_emails": ["emails/project-update.txt"]
+  },
+  {
+    "id": "proj-002",
+    "name": "Inference Optimization",
+    "description": "Benchmarking and optimizing latency for Hugging Face model inference",
+    "status": "in_progress",
+    "next_milestone": "Engineering Review Wednesday at 2 PM",
+    "current_tasks": ["Finish inference benchmark", "Generate inference comparison table", "Prepare engineering review summary"],
+    "related_documents": ["documents/ml-infrastructure-notes.txt"],
+    "related_emails": ["emails/meeting-followup.txt", "emails/deadline-reminder.txt"]
+  },
+  {
+    "id": "proj-003",
+    "name": "Browser Agent Research",
+    "description": "Researching browser-based tool execution and local RAG workflows",
+    "status": "in_progress",
+    "next_milestone": "Personal prototype demo",
+    "current_tasks": ["Personal browser agent architecture design", "Review Hugging Face Transformers release"],
+    "related_documents": ["documents/personal-goals.txt"],
+    "related_emails": ["emails/github-notification.txt"]
+  },
+  {
+    "id": "proj-004",
+    "name": "Open Source Contributions",
+    "description": "Attending conferences and contributing to open-source AI tooling",
+    "status": "planned",
+    "next_milestone": "Open Source AI Engineering Summit on October 14",
+    "current_tasks": ["Read recommended papers for AI Engineering Summit"],
+    "related_documents": ["documents/conference-plan.txt"],
+    "related_emails": ["emails/conference-invite.txt"]
+  }
+]

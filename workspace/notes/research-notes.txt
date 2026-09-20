@@ -1,0 +1,7 @@
+Interesting research topics:
+- retrieval augmented generation
+- agent memory
+- browser agents
+- tool calling
+- model evaluation
+- inference optimization

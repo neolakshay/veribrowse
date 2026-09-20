@@ -1,0 +1,8 @@
+Subject: Reminder: Engineering Review
+
+Reminder that the inference optimization update is expected before Wednesday's engineering review.
+
+Required:
+- Benchmark results
+- Comparison table
+- Short written summary
