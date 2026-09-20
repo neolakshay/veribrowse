@@ -23,6 +23,17 @@ const interventionReason = document.getElementById('interventionReason');
 const continueBtn = document.getElementById('continueBtn');
 const stopBtn = document.getElementById('stopBtn');
 
+const recoverySection = document.getElementById('recoverySection');
+const recoverySubtitle = document.getElementById('recoverySubtitle');
+const recoveryReason = document.getElementById('recoveryReason');
+const recoveryStepState = document.getElementById('recoveryStepState');
+const verifiedStepsList = document.getElementById('verifiedStepsList');
+const checkStateStatus = document.getElementById('checkStateStatus');
+const checkStateBtn = document.getElementById('checkStateBtn');
+const resumeBtn = document.getElementById('resumeBtn');
+const startFreshBtn = document.getElementById('startFreshBtn');
+const stopRecoveryBtn = document.getElementById('stopRecoveryBtn');
+
 const resultSection = document.getElementById('resultSection');
 const resultText = document.getElementById('resultText');
 
@@ -30,6 +41,7 @@ let eventSource = null;
 let timerInterval = null;
 let startTime = null;
 let showDevDetails = false;
+let currentRunId = null;
 
 // Preset Demo Task Prompt
 const DEMO_TASK_TEXT = "Find everything I need for my hackathon submission and open the submission page.";
@@ -38,6 +50,69 @@ demoBtn.addEventListener('click', () => {
   taskInput.value = DEMO_TASK_TEXT;
   taskInput.focus();
 });
+
+// Recovery UI Event Listeners
+if (checkStateBtn) {
+  checkStateBtn.addEventListener('click', async () => {
+    checkStateStatus.style.display = 'block';
+    checkStateStatus.textContent = 'Inspecting current browser state...';
+    try {
+      const res = await fetch('/api/checkpoint/check', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ runId: currentRunId })
+      });
+      const data = await res.json();
+      if (data.error) {
+        checkStateStatus.textContent = `❌ ${data.error}`;
+      } else {
+        const icon = data.currentStateMatches ? '✅' : (data.safeToResume ? '⚠️' : '❌');
+        checkStateStatus.textContent = `${icon} ${data.reason}`;
+      }
+    } catch (e) {
+      checkStateStatus.textContent = `❌ Error checking state: ${e.message}`;
+    }
+  });
+}
+
+if (resumeBtn) {
+  resumeBtn.addEventListener('click', async () => {
+    recoverySection.style.display = 'none';
+    setStatus('RESUMING', 'active');
+    setRunningState();
+    try {
+      await fetch('/api/checkpoint/resume', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ runId: currentRunId })
+      });
+    } catch (e) {
+      alert('Failed to resume checkpoint: ' + e.message);
+    }
+  });
+}
+
+if (startFreshBtn) {
+  startFreshBtn.addEventListener('click', () => {
+    recoverySection.style.display = 'none';
+    const task = taskInput.value.trim();
+    if (task) {
+      startTask(task);
+    } else {
+      alert('Please enter a task instruction.');
+    }
+  });
+}
+
+if (stopRecoveryBtn) {
+  stopRecoveryBtn.addEventListener('click', async () => {
+    recoverySection.style.display = 'none';
+    try {
+      await fetch('/api/stop', { method: 'POST' });
+    } catch (e) {}
+    restoreIdleButtons();
+  });
+}
 
 // Dev Details Toggle Handler
 toggleDevDetailsBtn.addEventListener('click', () => {
@@ -601,42 +676,159 @@ function handleEvent(event) {
       });
       break;
 
+    case 'task_achieved':
     case 'success':
       updatePipeline('complete', ['understand', 'plan', 'act', 'verify', 'complete']);
-      setStatus('VERIFIED', 'success');
-      resultText.textContent = event.result || 'Task verified successfully.';
+      setStatus('ACHIEVED', 'success');
+      resultText.textContent = event.result || 'Task completed and verified in browser reality.';
       resultSection.style.display = 'block';
       restoreIdleButtons();
 
       addTimelineCard({
-        tag: 'SUCCESS',
+        tag: 'ACHIEVED',
         tagClass: 'verified-success',
-        title: 'Task verified successfully',
+        title: 'Task state verified & achieved',
         details: event.result,
         rawEventObj: event
       });
       break;
 
-    case 'terminated':
-      setStatus('TERMINATED', 'error');
+    case 'task_unachievable':
+      updatePipeline('plan', ['understand'], ['verify']);
+      setStatus('UNACHIEVABLE', 'error');
+      resultText.textContent = `UNACHIEVABLE: ${event.reason || event.result || 'Goal cannot be reached after exploring candidate paths.'}`;
+      resultSection.style.display = 'block';
       restoreIdleButtons();
+
       addTimelineCard({
-        tag: 'STOPPED',
+        tag: 'UNACHIEVABLE',
         tagClass: 'error',
-        title: 'Task stopped',
-        details: event.result || 'Task execution stopped by user.',
+        title: 'Task confirmed unachievable',
+        details: event.reason || event.result || 'Exhausted available paths from verified state.',
         rawEventObj: event
       });
       break;
 
-    case 'error':
-      setStatus('ERROR', 'error');
-      restoreIdleButtons();
+    case 'recovery_started':
+      setStatus('RECOVERING', 'warning');
       addTimelineCard({
-        tag: 'STOPPED',
-        tagClass: 'error',
-        title: 'Encountered an issue',
-        details: 'VeriBrowse encountered a site loading issue and stopped safely.',
+        tag: 'RECOVERY',
+        tagClass: 'warning',
+        title: 'Recovering from verified checkpoint',
+        details: `Reason: ${event.reason || 'Candidate path failed.'} (${event.verifiedCount || 0} verified steps retained)`,
+        rawEventObj: event
+      });
+      break;
+
+    case 'checkpoint_loaded':
+      addTimelineCard({
+        tag: 'CHECKPOINT LOADED',
+        tagClass: 'step',
+        title: 'Loaded verified checkpoint',
+        details: `Restored progress from step ${event.step} (${event.verifiedCount || 0} verified steps)`,
+        rawEventObj: event
+      });
+      break;
+
+    case 'state_reconciled':
+      addTimelineCard({
+        tag: 'RECONCILED',
+        tagClass: 'step',
+        title: 'Reconciled browser state',
+        details: event.details || `Realigned browser state with ${event.verifiedUrl || 'checkpoint'}`,
+        rawEventObj: event
+      });
+      break;
+
+    case 'recovery_replanned':
+      setStatus('RE-PLANNING', 'active');
+      addTimelineCard({
+        tag: 'RE-PLANNING',
+        tagClass: 'planning',
+        title: 'Re-planning alternative candidate path',
+        details: event.details || 'Re-assessing remaining candidate paths from verified state...',
+        rawEventObj: event
+      });
+      break;
+
+    case 'recovery_succeeded':
+      setStatus('RECOVERED', 'active');
+      addTimelineCard({
+        tag: 'RECOVERY OK',
+        tagClass: 'verified-success',
+        title: 'Alternative path recovered successfully',
+        details: event.summary || 'Action verified after recovery.',
+        rawEventObj: event
+      });
+      break;
+
+    case 'task_paused':
+    case 'checkpoint_available':
+      currentRunId = event.runId;
+      setStatus('PAUSED SAFELY', 'warning');
+      restoreIdleButtons();
+      
+      if (recoveryReason) recoveryReason.textContent = event.reason || 'Task paused safely.';
+      if (recoveryStepState) recoveryStepState.textContent = `Step ${event.step || 0} / 12`;
+      
+      if (verifiedStepsList) {
+        verifiedStepsList.innerHTML = '';
+        const steps = event.verifiedSteps || [];
+        if (steps.length === 0) {
+          verifiedStepsList.innerHTML = '<li>No verified steps recorded yet.</li>';
+        } else {
+          steps.forEach(s => {
+            const li = document.createElement('li');
+            li.textContent = `Step ${s.step}: ${s.result || (s.action ? s.action.action : 'Action verified')}`;
+            verifiedStepsList.appendChild(li);
+          });
+        }
+      }
+
+      if (checkStateStatus) checkStateStatus.style.display = 'none';
+      if (recoverySection) recoverySection.style.display = 'block';
+      if (interventionSection) interventionSection.style.display = 'none';
+      if (resultSection) resultSection.style.display = 'none';
+
+      addTimelineCard({
+        tag: 'PAUSED',
+        tagClass: 'warning',
+        title: 'VeriBrowse paused safely',
+        details: `${event.reason || 'Progress saved.'} Use recovery options below.`,
+        rawEventObj: event
+      });
+      break;
+
+    case 'checkpoint_checking':
+      if (checkStateStatus) {
+        checkStateStatus.style.display = 'block';
+        checkStateStatus.textContent = 'Inspecting current browser state...';
+      }
+      break;
+
+    case 'checkpoint_validated':
+      if (checkStateStatus) {
+        checkStateStatus.style.display = 'block';
+        checkStateStatus.textContent = `✅ ${event.reason}`;
+      }
+      break;
+
+    case 'checkpoint_stale':
+      if (checkStateStatus) {
+        checkStateStatus.style.display = 'block';
+        checkStateStatus.textContent = `⚠️ ${event.reason}`;
+      }
+      break;
+
+    case 'checkpoint_resuming':
+      if (recoverySection) recoverySection.style.display = 'none';
+      setStatus('RESUMING', 'active');
+      setRunningState();
+      addTimelineCard({
+        tag: 'RESUMING',
+        tagClass: 'step',
+        title: 'Resuming task from checkpoint',
+        details: `Continuing execution from step ${event.step || 1}...`,
         rawEventObj: event
       });
       break;

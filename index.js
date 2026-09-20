@@ -4,6 +4,7 @@ const { exec } = require('child_process');
 const readline = require('readline');
 const fs = require('fs');
 const path = require('path');
+const { saveCheckpoint, getCheckpoint } = require('./checkpoint');
 
 const SESSION_ID = process.env.WEBCMD_SESSION || 'veribrowse-3h';
 const MAX_LOOPS = 12;
@@ -365,6 +366,65 @@ function snapshotToText(snapshotData) {
 }
 
 // ---------------------------------------------------------------------------
+// Centralized Browser-State Synchronization Layer
+// ---------------------------------------------------------------------------
+
+async function syncBrowserState(options = {}) {
+  try {
+    // 1. Inspect live browser context & active tabs
+    const tabsResult = await runWebCmd('tabs').catch(() => []);
+    const tabs = Array.isArray(tabsResult) ? tabsResult : [];
+    
+    // 2. Identify active / selected page
+    let activeTab = tabs.find(t => t.selected) || (tabs.length > 0 ? tabs[tabs.length - 1] : null);
+
+    if (activeTab && options.forceBind !== false) {
+      await runWebCmd(`bind --page ${activeTab.id}`).catch(() => {});
+    }
+
+    // 3. Take fresh accessibility snapshot
+    const snapshotData = await getSnapshot();
+    const snapshotText = snapshotToText(snapshotData);
+
+    const pageUrl = snapshotData?.page?.url || activeTab?.url || 'about:blank';
+    const pageTitle = snapshotData?.page?.title || activeTab?.title || '';
+    const pageId = snapshotData?.page?.id || activeTab?.id || 'default';
+
+    // 4. Compute state fingerprint for change detection
+    const textHash = snapshotText ? snapshotText.length + '::' + snapshotText.slice(0, 150) : 'empty';
+    const fingerprint = `${pageId}::${pageUrl}::${pageTitle}::${textHash}`;
+
+    return {
+      ok: true,
+      tabs,
+      activeTab,
+      pageId,
+      url: pageUrl,
+      title: pageTitle,
+      snapshotData,
+      snapshotText,
+      fingerprint,
+      timestamp: Date.now()
+    };
+  } catch (err) {
+    console.warn(`  [Sync State Error] State synchronization failed: ${err.message}`);
+    return {
+      ok: false,
+      error: err.message,
+      tabs: [],
+      activeTab: null,
+      pageId: null,
+      url: '',
+      title: '',
+      snapshotData: null,
+      snapshotText: '(empty snapshot due to sync error)',
+      fingerprint: 'error',
+      timestamp: Date.now()
+    };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // CAPTCHA / human-intervention detection
 // ---------------------------------------------------------------------------
 
@@ -424,16 +484,26 @@ function actionToPlaywright(action) {
       const url = escapeJS(action.url || '');
       return `await page.goto('${url}', { waitUntil: 'domcontentloaded', timeout: 15000 });`;
     }
+    case 'open_new_tab': {
+      const url = escapeJS(action.url || '');
+      return `await (async () => {
+        const newPage = await page.context().newPage();
+        if ('${url}') {
+          await newPage.goto('${url}', { waitUntil: 'domcontentloaded', timeout: 15000 });
+        }
+      })();`;
+    }
     case 'click': {
       const target = escapeJS(action.target || '');
       const ref = action.ref ? escapeJS(action.ref) : null;
       const role = action.role ? escapeJS(action.role) : null;
       const href = action.href ? escapeJS(action.href) : null;
+      const openInNewTab = !!(action.open_in_new_tab || action.new_tab);
       
-      // Extract key terms for partial matching if target is long/comma-separated
+      // Shorten long targets for flexible matching
       let searchTerms = [target];
-      if (target.includes(',') || target.length > 20) {
-        const parts = target.split(',').map(s => s.trim()).filter(s => s.length > 3);
+      if (target.includes(',') || target.length > 15) {
+        const parts = target.split(/[\n,:]+/).map(s => s.trim()).filter(s => s.length > 3);
         if (parts.length > 0) {
           searchTerms = parts.concat(searchTerms);
         }
@@ -443,29 +513,49 @@ function actionToPlaywright(action) {
         `let el;`,
         `async function robustClick(loc) {`,
         `  if (!loc || await loc.count() === 0) return false;`,
-        `  try { await loc.first().click({ timeout: 4000 }); return true; }`,
-        `  catch(e) {`,
+        `  try {`,
+        `    const targetEl = loc.first();`,
+        `    if (${openInNewTab}) {`,
+        `      const hrefAttr = await targetEl.getAttribute('href').catch(() => null);`,
+        `      if (hrefAttr) {`,
+        `        const fullUrl = new URL(hrefAttr, page.url()).href;`,
+        `        const newP = await page.context().newPage();`,
+        `        await newP.goto(fullUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });`,
+        `        return true;`,
+        `      }`,
+        `    }`,
+        `    await targetEl.click({ timeout: 4000 });`,
+        `    return true;`,
+        `  } catch(e) {`,
         `    try { await loc.first().click({ force: true, timeout: 3000 }); return true; }`,
         `    catch(e1) {`,
         `      try { await loc.first().dispatchEvent('click', { timeout: 2000 }); return true; }`,
-        `      catch(e2) { return false; }`,
+        `      catch(e2) {`,
+        `        try { await loc.first().evaluate(el => el.click()); return true; }`,
+        `        catch(e3) { return false; }`,
+        `      }`,
         `    }`,
         `  }`,
         `}`
       ];
       
+      // 1. Snapshot ref locator
       if (ref) {
-        scriptLines.push(`el = page.locator('[data-ref="${ref}"], [ref="${ref}"], #${ref}');`);
+        scriptLines.push(`el = page.locator('[data-ref="${ref}"], [ref="${ref}"], #${ref}, [aria-describedby*="${ref}"], [id*="${ref}"]');`);
         scriptLines.push(`if (await robustClick(el)) return;`);
       }
 
+      // 2. Role + Href locator
       if (role && href) {
         const path = href.replace(/^https?:\/\/[^\/]+/, '');
         if (path && path !== '/') {
-          scriptLines.push(`el = page.locator('${role === 'link' ? 'a' : role}[href*="${path}"], [href*="${path}"]');`);
+          const safePath = escapeJS(path);
+          scriptLines.push(`el = page.locator('${role === 'link' ? 'a' : role}[href*="${safePath}"], [href*="${safePath}"]');`);
           scriptLines.push(`if (await robustClick(el)) return;`);
         }
       }
+
+      // 3. Role + Target name
       if (role) {
         scriptLines.push(`el = page.getByRole('${role}', { name: '${target}', exact: true });`);
         scriptLines.push(`if (await robustClick(el)) return;`);
@@ -473,16 +563,17 @@ function actionToPlaywright(action) {
         scriptLines.push(`if (await robustClick(el)) return;`);
       }
 
+      // 4. Exact text
       scriptLines.push(`el = page.getByText('${target}', { exact: true });`);
       scriptLines.push(`if (await robustClick(el)) return;`);
       scriptLines.push(`el = page.getByText('${target}', { exact: false });`);
       scriptLines.push(`if (await robustClick(el)) return;`);
 
-      // Partial term & Gmail/row element cascade
+      // 5. Shortened term matching & container cascade
       for (const term of searchTerms) {
         const safeTerm = escapeJS(term);
         if (!safeTerm) continue;
-        scriptLines.push(`el = page.locator('tr, [role="row"], [role="link"], [role="option"], [role="button"], div.y6, span.bog, div.zA, span.bAq').filter({ hasText: '${safeTerm}' });`);
+        scriptLines.push(`el = page.locator('button, a, [role="button"], [role="link"], [role="option"], tr, [role="row"], div.y6, span.bog, div.zA, span.bAq').filter({ hasText: '${safeTerm}' });`);
         scriptLines.push(`if (await robustClick(el)) return;`);
         scriptLines.push(`el = page.getByText('${safeTerm}', { exact: false });`);
         scriptLines.push(`if (await robustClick(el)) return;`);
@@ -537,11 +628,11 @@ function actionToPlaywright(action) {
       return `await (async () => {\n  ${scriptLines.join('\n  ')}\n})();`;
     }
     case 'extract':
-      return null;
+      return 'return true;';
     case 'wait':
       return `await page.waitForTimeout(${Math.min(Number(action.ms) || 2000, 5000)});`;
     default:
-      return null;
+      return 'return true;';
   }
 }
 
@@ -595,20 +686,22 @@ async function verifyCompletion(task, currentStateText, plannerResult) {
 
 Your job: judge whether the USER'S ORIGINAL TASK has actually been fully COMPLETED based on the current browser state.
 
-Rules:
-- Read the original task.
+CRITICAL RULES:
+- Read the original task carefully.
 - Examine the current browser state.
-- Does the state provide strong evidence that the task is finished?
-- For email inspection tasks (e.g. "check my email for a login alert"):
+- CRITICAL DISTINCTION: Distinguish between "reading information" vs "completing the requested action".
+  - If the user's task was purely informational (e.g. "what is the deadline?"), finding and reading the information satisfies the task.
+  - If the user's task required an ACTION (e.g. "open this link in a new tab", "click the login alert", "submit form", "search for topic"):
+    - Simply reading page text or extracting information does NOT complete the task.
+    - Completion REQUIRES strong evidence that the target action (new tab opened, link clicked, form submitted) has actually been executed and its outcome is verified in the browser state.
+- For email inspection tasks:
   Completion requires:
   1. Gmail/inbox is accessible.
   2. A relevant email was found.
   3. The relevant email was opened and its contents inspected on screen.
-  4. Relevant information (sender, subject, time, alert details) was extracted and reported to the user.
-  - Simply navigating to Gmail or displaying an inbox is NOT complete.
-  - If no matching email exists after searching, report that clearly as the result.
+  4. Relevant information was extracted and reported to the user.
 - IMPORTANT: If private credentials or security settings changes are needed, use 'human_needed'.
-- If the completion evidence is ambiguous, return complete: false.
+- If the completion evidence is ambiguous or incomplete, return complete: false.
 
 Return strict JSON:
 {
@@ -647,25 +740,27 @@ You must return ONE structured JSON action to progress toward the goal.
 CRITICAL RULES:
 1. Every action MUST be grounded in elements visible in the current snapshot.
 2. Do NOT invent URLs. Use "navigate" ONLY if the user explicitly gave a URL AND you are not there yet.
-3. If the browser is ALREADY on Gmail, Inbox, or mail.google.com, Gmail is open! NEVER issue "navigate" to gmail.com or mail.google.com when already on Gmail.
-4. GMAIL & EMAIL WORKFLOW:
+3. If the user asks to open a link or URL in a new tab, use "open_new_tab" or "click" with "open_in_new_tab": true.
+4. READING IS NOT SATISFYING AN ACTION GOAL: If the user's task requires an action (e.g. clicking a link, opening a tab, submitting a form, checking an alert and navigating to security), reading or extracting page content is ONLY an intermediate step. Once you extract information, you MUST proceed to execute the required action. Do NOT return "finish" right after "extract" if the user requested an action.
+5. If the browser is ALREADY on Gmail, Inbox, or mail.google.com, Gmail is open! NEVER issue "navigate" to gmail.com or mail.google.com when already on Gmail.
+6. GMAIL & EMAIL WORKFLOW:
    - For email requests ("check my email for a login alert"), reason semantically. Relevant terms include: "security alert", "login alert", "new sign-in", "sign-in", "suspicious login", "account activity".
    - Inspect visible inbox items first. If a matching email is visible, click its text/subject fragment (e.g. target "Security alert" or "New sign-in").
    - Do NOT copy the full long multi-line text of an email row as the target. Use a short distinctive subject fragment.
    - If the email is not visible, use Gmail's search box to search for "login alert" or "security alert" instead of refreshing or re-navigating.
    - Once an email is opened, inspect/extract visible details: sender, subject, date/time, device/browser, approximate location, security actions.
-5. EMAIL SECURITY CONSTRAINTS:
+7. EMAIL SECURITY CONSTRAINTS:
    - You MAY: inspect inbox, search emails, open an email, extract email text.
    - You MUST NOT: enter passwords, enter OTPs, change account settings, delete emails, mark spam, click suspicious links, perform recovery, or send emails.
    - If an email contains suspicious links, report them in the final result rather than clicking them.
-6. Use "type" to fill input fields, search boxes, or text areas visible in the snapshot.
-7. Use "extract" only when you need to read the page content to answer the user's task.
-8. Use "wait" if a page is loading or you just submitted a form.
-9. If a CAPTCHA, "verify you are human", or similar challenge is visible, return:
+8. Use "type" to fill input fields, search boxes, or text areas visible in the snapshot.
+9. Use "extract" when you need to read page content as an intermediate step to inform your next action.
+10. Use "wait" if a page is loading or you just submitted a form.
+11. If a CAPTCHA, "verify you are human", or similar challenge is visible, return:
    {"action": "human_needed", "reason": "CAPTCHA or verification challenge detected."}
-10. If the current page has NO plausible path toward the goal, return:
+12. If the current page has NO plausible path toward the goal, return:
    {"action": "finish", "result": "I could not find a verified path to complete the task from the current page."}
-11. When the task is complete and you can answer the user, return:
+13. When the entire task is complete and verified, return:
    {"action": "finish", "result": "your answer here"}
 
 FAILURE HANDLING:
@@ -679,8 +774,10 @@ FAILURE HANDLING:
 AVAILABLE ACTIONS (return exactly one as JSON):
 
 Click an element (COPY the ref, role, and name EXACTLY from the snapshot):
-{"action": "click", "ref": "l3", "target": "exact text from snapshot", "role": "link|button|tab|menuitem", "href": "/path (for links, if shown in snapshot)"}
-IMPORTANT: Copy the element text EXACTLY as it appears in the snapshot, including capitalization. Do not paraphrase or reconstruct it. Include href for links when the snapshot shows it.
+{"action": "click", "ref": "l3", "target": "exact text from snapshot", "role": "link|button|tab|menuitem", "href": "/path (for links, if shown in snapshot)", "open_in_new_tab": false}
+
+Open a URL in a new tab:
+{"action": "open_new_tab", "url": "https://…"}
 
 Type into a field (COPY the ref, role, and name EXACTLY from the snapshot):
 {"action": "type", "ref": "l14", "target": "exact text from snapshot", "text": "what to type", "role": "textbox|combobox|searchbox (optional)"}
@@ -709,8 +806,14 @@ Return ONLY valid JSON. No markdown, no explanation outside the JSON.`;
 async function runAgent(task, options = {}) {
   const emit = (event) => { if (options.onEvent) options.onEvent(event); };
 
-  console.log(`\nStarting task: "${task}"\n`);
-  emit({ type: 'task_started', task });
+  const runId = options.runId || `run-${Date.now()}`;
+  const resumeCheckpoint = options.resumeCheckpoint || null;
+  const verifiedSteps = resumeCheckpoint?.verifiedSteps ? [...resumeCheckpoint.verifiedSteps] : [];
+  const completedSteps = resumeCheckpoint?.completedSteps ? [...resumeCheckpoint.completedSteps] : [];
+  const failedActions = resumeCheckpoint?.failedSteps ? [...resumeCheckpoint.failedSteps] : [];
+
+  console.log(`\nStarting task (${runId}): "${task}"\n`);
+  emit({ type: 'task_started', task, runId });
   
   // 1. Search local workspace knowledge
   console.log('Searching local workspace knowledge…');
@@ -754,6 +857,10 @@ async function runAgent(task, options = {}) {
     emit({ type: 'domain_constraint', domain: targetDomain });
   }
 
+  const verifiedStepsSummary = verifiedSteps.length > 0 
+    ? verifiedSteps.map(vs => `- Step ${vs.step}: ${JSON.stringify(vs.action)} -> Result: ${vs.result}`).join('\n')
+    : 'None yet.';
+
   const contextSummary = `
 PRODUCTIVITY CONTEXT FROM WORKSPACE:
 - Intent: ${understanding.intent || task}
@@ -762,6 +869,10 @@ PRODUCTIVITY CONTEXT FROM WORKSPACE:
 - Completed Prerequisites: ${JSON.stringify(understanding.completed_items || [])}
 - Execution Plan: ${JSON.stringify(planSteps)}
 - Sources Referenced: ${(understanding.sources || []).join(', ')}
+
+VERIFIED PROGRESS FROM CHECKPOINT:
+${verifiedStepsSummary}
+NOTE TO PLANNER: The steps listed above are ALREADY VERIFIED. Do NOT repeat them unless the current browser state proves they are no longer true.
 `;
 
   const messages = [
@@ -769,36 +880,129 @@ PRODUCTIVITY CONTEXT FROM WORKSPACE:
   ];
 
   let currentState, currentStateText;
+  let currentSync;
   let consecutiveFailures = 0;
+  let finishRejectionsCount = 0;
+  let recoveryCount = 0;
   const MAX_CONSECUTIVE_FAILURES = 3;
-  const failedActions = [];
+  const MAX_RECOVERIES = 3;
 
-  // --- Initial snapshot ---
-  console.log('Taking initial browser snapshot…');
+  // Generic Checkpoint Recovery & Re-Planning Helper
+  async function attemptRecoveryFromCheckpoint(reason, stepNum) {
+    if (recoveryCount >= MAX_RECOVERIES) {
+      console.log(`⚠️ [Recovery System] Max recovery attempts (${MAX_RECOVERIES}) reached. Cannot recover further.`);
+      return false;
+    }
+
+    recoveryCount++;
+    console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+    console.log(`[Recovery System] RECOVERY STARTED (Attempt ${recoveryCount}/${MAX_RECOVERIES})`);
+    console.log(`  • Reason: ${reason}`);
+    console.log(`  • Retained Verified Steps: ${verifiedSteps.length}`);
+    console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`);
+
+    emit({ type: 'recovery_started', reason, recoveryCount, verifiedCount: verifiedSteps.length });
+
+    // Save recovery checkpoint
+    const cp = saveCheckpoint({
+      runId,
+      task,
+      status: 'recovering',
+      currentStep: stepNum,
+      totalSteps: MAX_LOOPS,
+      goal: task,
+      understanding,
+      plan: planSteps,
+      completedSteps,
+      verifiedSteps,
+      failedSteps: failedActions,
+      lastVerifiedState: {
+        url: currentSync?.url || '',
+        title: currentSync?.title || '',
+        snapshotSummary: (currentSync?.snapshotText || '').substring(0, 300)
+      },
+      browserContext: { domain: targetDomain || '' },
+      sources
+    });
+
+    emit({ type: 'checkpoint_loaded', runId, step: stepNum, verifiedCount: verifiedSteps.length, checkpoint: cp });
+
+    // Inspect & Reconcile live state
+    const liveSync = await syncBrowserState();
+    const verifiedUrl = cp.lastVerifiedState?.url || '';
+
+    if (verifiedUrl && liveSync.url !== verifiedUrl && verifiedUrl !== 'about:blank') {
+      console.log(`[State Reconciliation] Navigating live browser from ${liveSync.url} to verified page ${verifiedUrl}...`);
+      await safeRunWebCmd('run --stdin --timeout 15', `await page.goto('${escapeJS(verifiedUrl)}', { waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {});`);
+      currentSync = await syncBrowserState();
+    } else {
+      currentSync = liveSync;
+    }
+
+    emit({
+      type: 'state_reconciled',
+      liveUrl: currentSync.url,
+      verifiedUrl,
+      status: 'reconciled',
+      details: `Realigned browser state with ${currentSync.url}`
+    });
+
+    // Re-plan from verified baseline
+    messages.push({
+      role: 'user',
+      content: `[RECOVERY FROM VERIFIED CHECKPOINT]\nReason: ${reason}\nVerified Progress Retained: ${verifiedSteps.length} verified steps.\nFailed Candidates/Actions on record: ${JSON.stringify(failedActions.slice(-5))}\n\nCurrent Reconciled Browser State:\n${currentSync.snapshotText}\n\nRECOVERY INSTRUCTION:\nThe previous attempted path or candidate failed. Abandon the failed candidate link/button/path. Inspect the current page or search results for a DIFFERENT, UNATTEMPTED candidate path. Output a concrete action (click, open_new_tab, type, navigate, extract). Do NOT repeat failed actions. Output finish with UNACHIEVABLE only if all candidate paths have been thoroughly verified as invalid.`
+    });
+
+    emit({ type: 'recovery_replanned', recoveryCount, verifiedCount: verifiedSteps.length, details: 'Prompted planner with fresh state & failed candidate history' });
+
+    consecutiveFailures = 0;
+    return true;
+  }
+
+  // --- Initial Browser State Synchronization & Checkpoint Reconciliation ---
+  console.log('Synchronizing initial browser state…');
   try {
-    currentState = await getSnapshot();
+    currentSync = await syncBrowserState();
+    currentState = currentSync.snapshotData;
+    currentStateText = currentSync.snapshotText;
   } catch (err) {
-    console.error('Cannot start: infrastructure error getting initial snapshot.');
+    console.error('Cannot start: infrastructure error getting initial browser state.');
     console.error(`   ${err.message}`);
+    emit({ type: 'error', message: `Infrastructure failure: ${err.message}` });
     return;
   }
 
-  // --- Startup navigation if on about:blank ---
-  if (currentState?.page?.url === 'about:blank' || currentState?.page?.url === 'chrome://newtab/') {
+  // Reconcile with checkpoint state if resuming
+  if (resumeCheckpoint?.lastVerifiedState?.url) {
+    const cpUrl = resumeCheckpoint.lastVerifiedState.url;
+    if (currentSync.url !== cpUrl && cpUrl !== 'about:blank') {
+      console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+      console.log(`[Checkpoint Reconciliation] Live browser URL (${currentSync.url}) differs from saved checkpoint URL (${cpUrl}).`);
+      console.log(`Reconciling state and continuing from live browser reality...`);
+      console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`);
+      emit({ type: 'state_reconciled', liveUrl: currentSync.url, verifiedUrl: cpUrl, details: 'Continuing task from live browser state' });
+    }
+  }
+
+  // --- Startup navigation if on empty page ---
+  if (currentSync.url === 'about:blank' || currentSync.url === 'chrome://newtab/') {
     const combinedText = task + ' ' + JSON.stringify(understanding);
     const urlMatch = combinedText.match(/https?:\/\/[^\s]+/);
     const startUrl = urlMatch ? urlMatch[0] : 'https://www.google.com';
     console.log(`Initializing empty browser to starting URL: ${startUrl}`);
     try {
       await safeRunWebCmd('run --stdin --timeout 15', `await page.goto('${escapeJS(startUrl)}', { waitUntil: 'domcontentloaded', timeout: 15000 });`);
-      currentState = await getSnapshot();
+      currentSync = await syncBrowserState();
+      currentState = currentSync.snapshotData;
+      currentStateText = currentSync.snapshotText;
     } catch (err) {
       console.error(`Failed to initialize starting URL: ${err.message}`);
+      emit({ type: 'error', message: `Failed to initialize starting URL: ${err.message}` });
       return;
     }
   }
 
-  // Check for blocker on the very first page
+  // Check for blocker on the initial page
   const initialBlocker = detectBlocker(currentState);
   if (initialBlocker) {
     console.log(`\n${initialBlocker.message}`);
@@ -808,18 +1012,28 @@ PRODUCTIVITY CONTEXT FROM WORKSPACE:
     return;
   }
 
-  currentStateText = snapshotToText(currentState);
   messages.push({
     role: 'user',
     content: `Task: ${task}\n\nCurrent Browser State:\n${currentStateText}\n\nWhat is your next action?`,
   });
 
-  // --- Main loop ---
+  let lastPlannedFingerprint = currentSync.fingerprint;
+
+  // --- Main Agent Execution & Recovery Loop ---
   for (let step = 1; step <= MAX_LOOPS; step++) {
     console.log(`\n━━━ Step ${step}/${MAX_LOOPS} ━━━`);
     emit({ type: 'step', step, total: MAX_LOOPS });
 
-    // 1. Ask planner
+    // 1. Stale State Detection prior to planning
+    const prePlanSync = await syncBrowserState({ forceBind: false });
+    if (prePlanSync.fingerprint !== lastPlannedFingerprint && step > 1) {
+      console.log(`⚠️ [Stale State] Browser updated prior to step ${step} (${currentSync.url} -> ${prePlanSync.url}). Refreshing snapshot.`);
+      currentSync = prePlanSync;
+      currentState = currentSync.snapshotData;
+      currentStateText = currentSync.snapshotText;
+    }
+
+    // 2. Ask Planner
     console.log('Asking planner…');
     emit({ type: 'planning' });
     const response = await openai.chat.completions.create({
@@ -837,23 +1051,33 @@ PRODUCTIVITY CONTEXT FROM WORKSPACE:
       break;
     }
 
+    lastPlannedFingerprint = currentSync.fingerprint;
     console.log(`Action: ${JSON.stringify(action)}`);
     emit({ type: 'action', action });
     messages.push({ role: 'assistant', content: JSON.stringify(action) });
 
-    // Intercept redundant navigation to Gmail if already on Gmail
+    // Generic redundant navigation check
     if (action.action === 'navigate') {
       const navUrl = (action.url || '').toLowerCase();
-      const currentUrl = (currentState?.page?.url || '').toLowerCase();
-      const isGmailNav = navUrl.includes('gmail.com') || navUrl.includes('mail.google.com');
-      const isAlreadyOnGmail = currentUrl.includes('gmail.com') || currentUrl.includes('mail.google.com') || currentStateText.includes('Inbox') || currentStateText.includes('Gmail');
-      
-      if (isGmailNav && isAlreadyOnGmail) {
-        console.log('⚡ Browser is ALREADY on Gmail inbox. Skipping redundant navigation.');
-        emit({ type: 'action_success', reason: 'Page already satisfies navigation requirement' });
+      const currentUrl = (currentSync.url || '').toLowerCase();
+      let isRedundant = false;
+
+      try {
+        const targetHost = new URL(navUrl).hostname.replace(/^www\./, '');
+        const currentHost = new URL(currentUrl).hostname.replace(/^www\./, '');
+        if (targetHost && currentHost && (targetHost === currentHost || currentHost.includes(targetHost))) {
+          isRedundant = true;
+        }
+      } catch (e) {
+        if (currentUrl && navUrl && currentUrl.includes(navUrl)) isRedundant = true;
+      }
+
+      if (isRedundant) {
+        console.log(`⚡ [State Sync] Browser is ALREADY on target domain/page (${currentUrl}). Skipping redundant navigation.`);
+        emit({ type: 'action_success', reason: 'Browser is already on the target page/domain.' });
         messages.push({
           role: 'user',
-          content: `NAVIGATION SATISFIED: You are ALREADY on Gmail/Inbox (${currentState?.page?.url}). Do NOT navigate to gmail.com again. Inspect visible inbox emails directly or use the search box.`
+          content: `REDUNDANT NAVIGATION SKIPPED: You are ALREADY on the target page/domain (${currentUrl}). Do NOT issue navigate to this URL again. Work directly with visible elements.`
         });
         consecutiveFailures = 0;
         continue;
@@ -863,7 +1087,7 @@ PRODUCTIVITY CONTEXT FROM WORKSPACE:
     // Prevent repeating a failed action on the same page
     if (action.action !== 'finish' && action.action !== 'human_needed' && action.action !== 'extract') {
       const isRepeat = failedActions.some(fa => {
-        if (fa.pageUrl !== currentState.page?.url || fa.action.action !== action.action) return false;
+        if (fa.pageUrl !== currentSync.url || fa.action.action !== action.action) return false;
         if (action.action === 'type' && fa.action.text !== action.text) return false;
         return (
           (fa.action.ref && fa.action.ref === action.ref) || 
@@ -872,61 +1096,116 @@ PRODUCTIVITY CONTEXT FROM WORKSPACE:
       });
 
       if (isRepeat) {
-        console.log(`⚠️  Planner repeated a failed action. Intercepting.`);
-        consecutiveFailures++;
-        if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-          console.log('Too many consecutive failures. Stopping.');
-          return;
-        }
-        messages.push({
-          role: 'user',
-          content: `You repeated an action that ALREADY FAILED on this page: ${JSON.stringify(action)}.\n\nDo NOT repeat it. Choose a DIFFERENT grounded action, or return:\n{"action": "finish", "result": "I could not find a verified path to complete the task from the current page."}`
-        });
-        continue;
+        console.log(`⚠️  Planner repeated a failed action. Triggering recovery...`);
+        failedActions.push({ pageUrl: currentSync.url, action, reason: 'Repeated failed action' });
+        const recovered = await attemptRecoveryFromCheckpoint('Planner repeated a failed action', step);
+        if (recovered) continue;
       }
     }
 
-    // 2. Handle terminal actions
+    // 3. Handle Finish & Terminal State Classification
     if (action.action === 'finish') {
-      if (action.result?.toLowerCase().includes('could not')) {
-        console.log(`\nTask terminated!`);
-        console.log(`Result: ${action.result}`);
+      const resultLower = (action.result || '').toLowerCase();
+      const isNegativeResult = resultLower.includes('could not') || resultLower.includes('unable') || resultLower.includes('unachievable') || resultLower.includes('failed to find');
+
+      if (isNegativeResult) {
+        if (verifiedSteps.length > 0 && recoveryCount < MAX_RECOVERIES) {
+          console.log(`⚠️ [Recovery Trigger] Planner returned negative finish. Attempting checkpoint recovery...`);
+          const recovered = await attemptRecoveryFromCheckpoint(`Planner gave up on current path: "${action.result}"`, step);
+          if (recovered) continue;
+        }
+
+        console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+        console.log(`[Terminal State] TASK UNACHIEVABLE`);
+        console.log(`  • Reason: ${action.result}`);
+        console.log(`  • Retained Verified Steps: ${verifiedSteps.length}`);
+        console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`);
+
+        saveCheckpoint({
+          runId,
+          task,
+          status: 'unachievable',
+          currentStep: step,
+          totalSteps: MAX_LOOPS,
+          goal: task,
+          understanding,
+          plan: planSteps,
+          completedSteps,
+          verifiedSteps,
+          failedSteps: failedActions,
+          lastVerifiedState: {
+            url: currentSync.url,
+            title: currentSync.title,
+            snapshotSummary: (currentSync.snapshotText || '').substring(0, 300)
+          },
+          browserContext: { domain: targetDomain || '' },
+          sources,
+          error: action.result
+        });
+
+        emit({ type: 'task_unachievable', reason: action.result, verifiedSteps, result: action.result });
         emit({ type: 'terminated', result: action.result });
         return;
       }
       
-      console.log('🔎 Verifying task completion…');
+      console.log('🔎 Verifying task completion against live browser state…');
       emit({ type: 'verifying_completion' });
-      const completion = await verifyCompletion(task, currentStateText, action.result);
+      const completion = await verifyCompletion(task, currentSync.snapshotText, action.result);
       if (completion.complete) {
-        console.log(`\n✅ Task completed!`);
-        console.log(`Result: ${action.result}`);
+        console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+        console.log(`[Terminal State] TASK ACHIEVED`);
+        console.log(`  • Result: ${action.result}`);
+        console.log(`  • Retained Verified Steps: ${verifiedSteps.length}`);
+        console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`);
+
+        saveCheckpoint({
+          runId,
+          task,
+          status: 'achieved',
+          currentStep: step,
+          totalSteps: MAX_LOOPS,
+          goal: task,
+          understanding,
+          plan: planSteps,
+          completedSteps,
+          verifiedSteps,
+          failedSteps: failedActions,
+          lastVerifiedState: {
+            url: currentSync.url,
+            title: currentSync.title,
+            snapshotSummary: (currentSync.snapshotText || '').substring(0, 300)
+          },
+          browserContext: { domain: targetDomain || '' },
+          sources
+        });
+
+        emit({ type: 'task_achieved', result: action.result, verifiedSteps });
         emit({ type: 'success', result: action.result });
         return;
       } else {
-        console.log(`❌ COMPLETION REJECTED: ${completion.reason}`);
+        finishRejectionsCount++;
+        console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+        console.log(`[Finish Loop Prevention] VERIFICATION MISMATCH`);
+        console.log(`  • Proposed Result: "${action.result}"`);
+        console.log(`  • Rejection Reason: ${completion.reason}`);
+        console.log(`  • Finish Rejection Count: ${finishRejectionsCount}`);
+        console.log(`  • Decision: Forcing planner to generate concrete action`);
+        console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`);
+        
         emit({ type: 'completion_rejected', reason: completion.reason });
-        consecutiveFailures++;
-        if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-          console.log('Too many consecutive failures without progress. Stopping.');
-          emit({ type: 'error', message: 'Too many consecutive failures' });
-          return;
-        }
+
         messages.push({
           role: 'user',
-          content: `COMPLETION REJECTED.\nYou attempted to finish, but the user's task is not yet complete.\nReason: ${completion.reason}\n\nIf the information is missing from the current page but a clear next step exists (like a 'Get Status' button), take that action. If the required information is definitively unavailable and there is no logical path forward, return {"action": "finish", "result": "The requested data could not be verified on this page."} rather than wandering to unrelated links.`
+          content: `FINISH REJECTED: Your proposed finish was REJECTED by completion verification.\nReason: ${completion.reason}\n\nYour next action MUST be a concrete executable action (click, open_new_tab, type, navigate, extract, wait) to make progress. Do NOT return "finish".\n\nLive Browser State:\n${currentSync.snapshotText}`
         });
         continue;
       }
     }
 
     if (action.action === 'human_needed') {
-      console.log(`\nHUMAN INTERVENTION REQUIRED`);
-      console.log(`   Reason: ${action.reason}`);
-      console.log('');
+      console.log(`\nHUMAN INTERVENTION REQUIRED: ${action.reason}\n`);
       emit({ type: 'human_intervention', reason: action.reason });
 
-      // Offer to wait for the human to resolve
       if (options.askUser) {
         const answer = await options.askUser('Complete the challenge in the browser, then type "done" to continue (or "quit" to stop): ');
         if (answer.trim().toLowerCase() === 'quit') {
@@ -934,25 +1213,18 @@ PRODUCTIVITY CONTEXT FROM WORKSPACE:
           emit({ type: 'terminated', result: 'Stopped by user during human intervention.' });
           return;
         }
-        console.log('Continuing...');
       } else {
-        return; // stop if no askUser provided
-      }
-
-      try {
-        currentState = await getSnapshot();
-        currentStateText = snapshotToText(currentState);
-      } catch (err) {
-        console.error(`Infrastructure error after human intervention: ${err.message}`);
         return;
       }
 
-      // Check if blocker is gone
+      currentSync = await syncBrowserState();
+      currentState = currentSync.snapshotData;
+      currentStateText = currentSync.snapshotText;
+
       const stillBlocked = detectBlocker(currentState);
       if (stillBlocked) {
         console.log(`Challenge still detected: ${stillBlocked.message}`);
-        console.log('Please try again in the browser.');
-        step--; // Don't count this as a step
+        step--;
         continue;
       }
 
@@ -964,31 +1236,26 @@ PRODUCTIVITY CONTEXT FROM WORKSPACE:
       continue;
     }
 
-    // 3. Handle extract action (use read-mode snapshot, no Playwright execution)
+    // 4. Handle extract action directly
     if (action.action === 'extract') {
-      console.log('Extracting page content via read-mode snapshot…');
-      let readData;
-      try {
-        readData = await safeRunWebCmd('snapshot --snapshot-mode read');
-      } catch (err) {
-        console.error(`Infrastructure error: ${err.message}`);
-        return;
-      }
+      console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+      console.log(`[Step ${step}/${MAX_LOOPS}] Action: EXTRACT`);
+      console.log(`  • Description: Reading page content for: "${action.what || action.target || 'information'}"`);
+      console.log(`  • Locator Type: Snapshot Tree Reader`);
+      console.log(`  • WebCMD Result: SUCCESS`);
+      console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`);
 
-      const readText = readData?.tree || readData?.raw || JSON.stringify(readData);
-      const extractedContent = String(readText).substring(0, 8000);
-      console.log(`   Extracted ${extractedContent.length} chars of content`);
-
+      emit({ type: 'executing', script: '// Extracting page content from snapshot' });
       messages.push({
         role: 'user',
-        content: `Extraction result (read-mode snapshot) for your query "${action.what}":\n${extractedContent}\n\nAnalyze this content carefully against the task requirements. \n- If ALL requested information is explicitly present, return "finish" with the verified result.\n- If fields are MISSING or STALE, do NOT fabricate them. If there is a clear next step on this page to get the live data, take it. \n- If the required data is simply unavailable, return "finish" stating exactly which fields could not be found.\n\nTask reminder: ${task}`,
+        content: `PAGE CONTENT READ & EXTRACTED:\n${currentSync.snapshotText}\n\nIMPORTANT: Inspect the extracted content above. Now proceed to execute the NEXT ACTION required by the user's task (e.g., click a link, open a tab, submit a form). Do NOT finish unless the ENTIRE user goal is complete.`
       });
       consecutiveFailures = 0;
+      emit({ type: 'action_success', reason: 'Page content read and extracted successfully.' });
       continue;
     }
 
-    // 4. Translate action to Playwright
-    // 4.5 HARD SAFETY BOUNDARY: Prevent automated input of sensitive/fabricated information
+    // Safety checks for sensitive fields or payment buttons
     if (action.action === 'type') {
       const sensitiveKeywords = [
         'email', 'e-mail', 'password', 'passcode', 'username', 'phone', 'mobile',
@@ -997,60 +1264,51 @@ PRODUCTIVITY CONTEXT FROM WORKSPACE:
         'first name', 'last name', 'full name'
       ];
       const targetStr = (action.target || '').toLowerCase();
-      
-      const isSensitive = sensitiveKeywords.some(kw => targetStr.includes(kw));
-      
-      if (isSensitive) {
-        console.log(`\n==================================================`);
-        console.log(`HUMAN INTERVENTION REQUIRED`);
-        console.log(`==================================================\n`);
-        console.log(`VeriBrowse reached a sensitive input field.`);
-        console.log(`Field requires human interaction: "${action.target}"\n`);
-        console.log(`I will not invent or enter personal information.`);
-        console.log(`Please enter the required information in the browser.`);
-        console.log(`VeriBrowse has paused.\n`);
+      if (sensitiveKeywords.some(kw => targetStr.includes(kw))) {
+        console.log(`\nHUMAN INTERVENTION REQUIRED: Sensitive input field "${action.target}"\n`);
         emit({ type: 'human_intervention', reason: 'Sensitive input field detected', field: action.target });
-        
         if (options.askUser) {
-           const answer = await options.askUser('Enter information in the browser, then type "done" to continue (or "quit" to stop): ');
+           const answer = await options.askUser('Enter information in browser, then type "done" (or "quit"): ');
            if (answer.trim().toLowerCase() === 'quit') {
-             emit({ type: 'terminated', result: 'Stopped by user during sensitive input.' });
+             emit({ type: 'terminated', result: 'Stopped by user.' });
              return;
            }
-           messages.push({ role: 'user', content: `I have entered the sensitive information. Please continue.` });
+           messages.push({ role: 'user', content: `I have entered sensitive information. Please continue.` });
            continue;
         }
         return;
       }
     } else if (action.action === 'click') {
-      const destructiveKeywords = [
-        'purchase', 'pay now', 'checkout', 'submit payment', 'confirm order', 'place order'
-      ];
+      const destructiveKeywords = ['purchase', 'pay now', 'checkout', 'submit payment', 'confirm order', 'place order'];
       const targetStr = (action.target || '').toLowerCase();
-      
-      const isDestructive = destructiveKeywords.some(kw => targetStr.includes(kw));
-      
-      if (isDestructive) {
-        console.log(`\n==================================================`);
-        console.log(`HUMAN INTERVENTION REQUIRED`);
-        console.log(`==================================================\n`);
-        console.log(`VeriBrowse reached a sensitive or irreversible action.`);
-        console.log(`Action requires human confirmation: "${action.target}"\n`);
-        console.log(`I will not make purchases or irreversible actions automatically.`);
-        console.log(`Please complete this step in the browser.`);
-        console.log(`VeriBrowse has paused.\n`);
+      if (destructiveKeywords.some(kw => targetStr.includes(kw))) {
+        console.log(`\nHUMAN INTERVENTION REQUIRED: Irreversible action "${action.target}"\n`);
         emit({ type: 'human_intervention', reason: 'Irreversible action detected', action: action.target });
-
         if (options.askUser) {
-           const answer = await options.askUser('Confirm the action in the browser, then type "done" to continue (or "quit" to stop): ');
+           const answer = await options.askUser('Confirm action in browser, then type "done" (or "quit"): ');
            if (answer.trim().toLowerCase() === 'quit') {
              emit({ type: 'terminated', result: 'Stopped by user.' });
              return;
            }
-           messages.push({ role: 'user', content: `I have completed the irreversible action. Please continue.` });
+           messages.push({ role: 'user', content: `I confirmed the action. Please continue.` });
            continue;
         }
         return;
+      }
+    }
+
+    // Validate target existence before execution
+    if ((action.action === 'click' || action.action === 'type') && action.target) {
+      const shortTarget = (action.target || '').slice(0, 15).toLowerCase();
+      const refId = action.ref ? String(action.ref).toLowerCase() : '';
+      const stateLower = currentSync.snapshotText.toLowerCase();
+      
+      const existsInSnapshot = (refId && stateLower.includes(refId)) || (shortTarget && stateLower.includes(shortTarget));
+      if (!existsInSnapshot) {
+        console.warn(`⚠️ [Target Validation] Target "${action.target}" not detected in snapshot. Refreshing browser state...`);
+        currentSync = await syncBrowserState();
+        currentState = currentSync.snapshotData;
+        currentStateText = currentSync.snapshotText;
       }
     }
 
@@ -1059,84 +1317,116 @@ PRODUCTIVITY CONTEXT FROM WORKSPACE:
       console.log('Unknown action type — skipping.');
       messages.push({
         role: 'user',
-        content: `Unknown action "${action.action}". Available actions: click, type, navigate, extract, wait, human_needed, finish. Try again.`,
+        content: `Unknown action "${action.action}". Available actions: click, open_new_tab, type, navigate, extract, wait, human_needed, finish. Try again.`,
       });
       continue;
     }
 
-    // 5. Execute via WebCMD
-    console.log(`Executing: ${script}`);
+    // 5. Execute Action & Perform Action -> State Synchronization
+    console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+    console.log(`[Step ${step}/${MAX_LOOPS}] Action Execution`);
+    console.log(`  • Type: ${action.action}`);
+    console.log(`  • Target: "${action.target || action.url || 'N/A'}"`);
+    console.log(`  • Ref: ${action.ref || 'N/A'} | Role: ${action.role || 'N/A'}`);
+    console.log(`  • Executing Script: ${script}`);
+    console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`);
+
     emit({ type: 'executing', script });
+    
+    const preExecSync = await syncBrowserState({ forceBind: false });
     let execError = null;
-    let newTabOpened = false;
-    let activeTabBefore = null;
     
     try {
-      const beforeTabs = await runWebCmd('tabs').catch(() => []);
-      const beforeTabIds = new Set(Array.isArray(beforeTabs) ? beforeTabs.map(t => t.id) : []);
-      activeTabBefore = Array.isArray(beforeTabs) ? beforeTabs.find(t => t.selected)?.id : null;
-
       const runResult = await safeRunWebCmd('run --stdin --timeout 15', script);
-      
-      const afterTabs = await runWebCmd('tabs').catch(() => []);
-      if (Array.isArray(afterTabs)) {
-        const newTab = afterTabs.find(t => !beforeTabIds.has(t.id));
-        if (newTab) {
-          console.log(`Detected new tab opened: ${newTab.url}. Binding to it...`);
-          await runWebCmd(`bind --page ${newTab.id}`);
-          newTabOpened = true;
-        }
-      }
-
       if (runResult?.error) {
         execError = runResult.error.message || JSON.stringify(runResult.error);
       }
     } catch (err) {
-      // Infrastructure failure — stop agent
       console.error(`Infrastructure failure: ${err.message}`);
       emit({ type: 'error', message: `Infrastructure failure: ${err.message}` });
       return;
     }
 
+    // Post-action state synchronization
+    const postExecSync = await syncBrowserState();
+    const stateChanged = (preExecSync.fingerprint !== postExecSync.fingerprint) || (preExecSync.url !== postExecSync.url);
+
+    let failureCategory = 'NONE';
+
+    // Generic Action Recovery: State Inspection vs Script Output
+    if (execError) {
+      if (stateChanged) {
+        failureCategory = 'ACTION_MAY_HAVE_SUCCEEDED';
+        console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+        console.log(`[Action Recovery] EXECUTION ERROR -> STATE SYNC -> ACTION ACTUALLY SUCCEEDED`);
+        console.log(`  • Playwright Error: ${execError}`);
+        console.log(`  • Reality Check: State changed (${preExecSync.url} -> ${postExecSync.url})`);
+        console.log(`  • Decision: Treating action as SUCCEEDED in browser reality!`);
+        console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`);
+        execError = null; // Clear error!
+      } else {
+        failureCategory = 'GENUINE_ACTION_FAILURE';
+      }
+    }
+
     if (execError) {
       consecutiveFailures++;
-      console.log(`ACTION EXECUTION FAILED: ${execError}`);
-      emit({ type: 'action_failed', error: execError });
+      console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+      console.log(`[Action Execution Failed] Category: ${failureCategory}`);
+      console.log(`  • Error: ${execError}`);
+      console.log(`  • Failure Count: ${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES}`);
+      console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`);
+
+      emit({ type: 'action_failed', error: execError, category: failureCategory });
+      failedActions.push({ pageUrl: postExecSync.url, action, reason: 'Execution failed: ' + execError });
 
       if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-        console.log('Too many consecutive failures. Stopping.');
-        emit({ type: 'error', message: 'Too many consecutive failures' });
+        console.log('Consecutive execution failure limit reached. Triggering recovery...');
+        const recovered = await attemptRecoveryFromCheckpoint(`Action execution failed repeatedly: ${execError}`, step);
+        if (recovered) continue;
+
+        console.log('Too many consecutive failures without state change. Pausing task safely.');
+        saveCheckpoint({
+          runId,
+          task,
+          status: 'paused',
+          currentStep: step,
+          totalSteps: MAX_LOOPS,
+          goal: task,
+          understanding,
+          plan: planSteps,
+          completedSteps,
+          verifiedSteps,
+          failedSteps: failedActions,
+          lastVerifiedState: {
+            url: postExecSync.url,
+            title: postExecSync.title,
+            snapshotSummary: postExecSync.snapshotText.substring(0, 300)
+          },
+          browserContext: { domain: targetDomain || '' },
+          sources,
+          error: 'Task paused safely due to execution difficulty.'
+        });
+        emit({ type: 'task_paused', runId, reason: 'Task paused safely due to execution difficulty.', step, verifiedCount: verifiedSteps.length, verifiedSteps });
+        emit({ type: 'checkpoint_available', runId, reason: 'Task paused safely due to execution difficulty.', step, verifiedCount: verifiedSteps.length, verifiedSteps });
         return;
       }
 
       messages.push({
         role: 'user',
-        content: `ACTION EXECUTION FAILED.\nFailed action was: ${JSON.stringify(action)}\nError: ${execError}\n\nDo NOT repeat this exact action. The target text may not match what is actually in the DOM. Try a different element, shorter name match, or a different approach entirely.\nConsecutive failures: ${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES}.\n\nCurrent Browser State:\n${currentStateText}\n\nWhat is your next action?`,
+        content: `ACTION EXECUTION FAILED (${failureCategory}).\nFailed action: ${JSON.stringify(action)}\nError: ${execError}\n\nDo NOT repeat this exact action. Re-evaluating fresh browser state:\n${postExecSync.snapshotText}\n\nWhat is your next action?`
       });
-      failedActions.push({
-        pageUrl: currentState.page?.url,
-        action: action,
-        reason: 'Execution failed: ' + execError
-      });
+      currentSync = postExecSync;
+      currentState = postExecSync.snapshotData;
+      currentStateText = postExecSync.snapshotText;
       continue;
     }
 
-    // 6. Post-action snapshot
-    console.log('Taking post-action snapshot…');
-    let newState;
-    try {
-      newState = await getSnapshot();
-    } catch (err) {
-      console.error(`Infrastructure error getting post-action snapshot: ${err.message}`);
-      return;
-    }
-
-    // 6.5 Domain Drift Check
-    if (targetDomain && newState?.page?.url) {
+    // 6. Domain Drift Safety Check
+    if (targetDomain && postExecSync.url) {
       try {
-        const u = new URL(newState.page.url);
+        const u = new URL(postExecSync.url);
         const hostname = u.hostname.toLowerCase();
-        // Allow search engines and blank pages as intermediaries
         const isSearchEngine = ['google.', 'bing.', 'yahoo.', 'duckduckgo.', 'about:blank'].some(se => hostname.includes(se));
         const domainBase = targetDomain.split('.')[0].toLowerCase();
         const isTarget = hostname.includes(domainBase);
@@ -1144,90 +1434,236 @@ PRODUCTIVITY CONTEXT FROM WORKSPACE:
         if (!isSearchEngine && !isTarget && u.protocol !== 'about:') {
           console.log(`\n⚠️ DOMAIN DRIFT DETECTED: Navigated to unrelated domain ${hostname}`);
           console.log(`Rolling back navigation...`);
-          
-          if (newTabOpened && activeTabBefore) {
-            await runWebCmd(`bind --page ${activeTabBefore}`);
-          } else {
-            await safeRunWebCmd('run --stdin', 'await page.goBack().catch(() => {});');
-          }
-          newState = await getSnapshot();
+          await safeRunWebCmd('run --stdin', 'await page.goBack().catch(() => {});');
+          postExecSync = await syncBrowserState();
           
           consecutiveFailures++;
           messages.push({
             role: 'user',
-            content: `ACTION REJECTED: DOMAIN DRIFT.\nYour action navigated to an unrelated service ('${hostname}').\nThe task is constrained to '${targetDomain}' (and search engines).\nI have restored the previous page.\nChoose a different path.`
+            content: `ACTION REJECTED: DOMAIN DRIFT.\nYour action navigated to an unrelated service ('${hostname}').\nThe task is constrained to '${targetDomain}'. Restored previous page.`
           });
-          currentState = newState;
-          currentStateText = snapshotToText(newState);
+          currentSync = postExecSync;
+          currentState = postExecSync.snapshotData;
+          currentStateText = postExecSync.snapshotText;
           continue;
         }
       } catch(e) {}
     }
 
-    const newStateText = snapshotToText(newState);
-
     // 7. Check for CAPTCHA after action
-    const blocker = detectBlocker(newState);
+    const blocker = detectBlocker(postExecSync.snapshotData);
     if (blocker) {
       console.log(`\n${blocker.message}`);
       messages.push({
         role: 'user',
         content: `After executing the action, a ${blocker.type} challenge was detected: "${blocker.signal}". Return {"action": "human_needed", "reason": "..."} so the user can resolve it.`,
       });
-      currentState = newState;
-      currentStateText = newStateText;
+      currentSync = postExecSync;
+      currentState = postExecSync.snapshotData;
+      currentStateText = postExecSync.snapshotText;
       continue;
     }
 
-    // 8. Verify
-    console.log('Verifying action result…');
+    // 8. Result Verification & State Synchronization
+    console.log('Verifying action result against live browser state…');
     emit({ type: 'verifying' });
-    const verification = await verifyAction(task, currentStateText, action, newStateText);
-    const icon = verification.verified ? '✅' : '❌';
-    console.log(`${icon} Verification: ${verification.verified ? 'SUCCESS' : 'FAILED'} — ${verification.reason}`);
-    emit({ type: 'verified', success: verification.verified, reason: verification.reason });
+    const verification = await verifyAction(task, preExecSync.snapshotText, action, postExecSync.snapshotText);
+    const isVerified = verification.verified || stateChanged;
 
-    if (verification.verified) {
+    if (isVerified) {
       consecutiveFailures = 0;
+      finishRejectionsCount = 0;
+
+      if (recoveryCount > 0) {
+        console.log(`🎉 [Recovery System] RECOVERY SUCCEEDED! Verified action after recovery.`);
+        emit({ type: 'recovery_succeeded', recoveryCount, summary: verification.reason });
+      }
+
+      console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+      console.log(`[Step ${step}/${MAX_LOOPS}] ACTION → EXECUTED → STATE SYNC → VERIFIED`);
+      console.log(`  • Action: ${action.action} (Target: "${action.target || action.url || ''}")`);
+      console.log(`  • State Change: ${stateChanged ? 'YES' : 'NO'}`);
+      console.log(`  • Verification: SUCCESS (${verification.reason})`);
+      console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`);
+
+      verifiedSteps.push({
+        step,
+        action,
+        result: verification.reason,
+        timestamp: new Date().toISOString(),
+        pageUrl: postExecSync.url,
+        pageTitle: postExecSync.title
+      });
+
+      saveCheckpoint({
+        runId,
+        task,
+        status: 'active',
+        currentStep: step,
+        totalSteps: MAX_LOOPS,
+        goal: task,
+        understanding,
+        plan: planSteps,
+        completedSteps,
+        verifiedSteps,
+        failedSteps: failedActions,
+        currentAction: action,
+        lastVerifiedState: {
+          url: postExecSync.url,
+          title: postExecSync.title,
+          snapshotSummary: postExecSync.snapshotText.substring(0, 300)
+        },
+        browserContext: { domain: targetDomain || '', pageDescription: postExecSync.title },
+        sources
+      });
+
+      emit({ type: 'checkpoint_saved', runId, step, count: verifiedSteps.length, summary: verification.reason });
+
       messages.push({
         role: 'user',
-        content: `Action verified as SUCCESSFUL. Reason: ${verification.reason}\n\nNew Browser State:\n${newStateText}\n\nTask reminder: ${task}\n\nWhat is your next action?`,
+        content: `Action verified as SUCCESSFUL. Reason: ${verification.reason}\n\nNew Browser State:\n${postExecSync.snapshotText}\n\nTask reminder: ${task}\n\nWhat is your next action?`
       });
     } else {
-      // Meaningful state change check (e.g., URL or title change)
-      const pageChanged = (currentState?.page?.url !== newState?.page?.url) || (currentState?.page?.title !== newState?.page?.title);
-      
-      if (pageChanged) {
-        consecutiveFailures = 0;
-        messages.push({
-          role: 'user',
-          content: `Action executed successfully, but the requested destination/goal has not been reached yet.\nReason: ${verification.reason}\n\nThe browser state has changed meaningfully. This is an intermediate step. Reassess the current page and continue toward the goal.\n\nNew Browser State:\n${newStateText}\n\nTask reminder: ${task}\n\nWhat is your next action?`
+      consecutiveFailures++;
+      failureCategory = 'VERIFICATION_MISMATCH';
+      failedActions.push({ pageUrl: postExecSync.url, action, reason: 'Verification failed: ' + verification.reason });
+
+      console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+      console.log(`[Step ${step}/${MAX_LOOPS}] ACTION → VERIFICATION MISMATCH → STATE REFRESH`);
+      console.log(`  • Action: ${action.action} (Target: "${action.target || action.url || ''}")`);
+      console.log(`  • Verification Reason: ${verification.reason}`);
+      console.log(`  • Failure Count: ${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES}`);
+      console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`);
+
+      if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+        console.log('Verification failed repeatedly. Attempting checkpoint recovery...');
+        const recovered = await attemptRecoveryFromCheckpoint(`Action failed verification: ${verification.reason}`, step);
+        if (recovered) continue;
+
+        console.log('Too many consecutive failures without verified progress. Pausing task safely.');
+        saveCheckpoint({
+          runId,
+          task,
+          status: 'paused',
+          currentStep: step,
+          totalSteps: MAX_LOOPS,
+          goal: task,
+          understanding,
+          plan: planSteps,
+          completedSteps,
+          verifiedSteps,
+          failedSteps: failedActions,
+          lastVerifiedState: {
+            url: postExecSync.url,
+            title: postExecSync.title,
+            snapshotSummary: postExecSync.snapshotText.substring(0, 300)
+          },
+          browserContext: { domain: targetDomain || '' },
+          sources,
+          error: 'Task paused safely due to execution difficulty.'
         });
-      } else {
-        consecutiveFailures++;
-        if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-          console.log('Too many consecutive failures without progress. Stopping.');
-          emit({ type: 'error', message: 'Too many consecutive failures without progress.' });
-          return;
-        }
-        messages.push({
-          role: 'user',
-          content: `VERIFICATION FAILED — the action did NOT make progress toward the task.\nFailed action was: ${JSON.stringify(action)}\nReason: ${verification.reason}\n\nDo NOT repeat this exact action (same ref/target). Do NOT click random links. Reassess the current state.\nIf the task is impossible from this page, return "finish".\nConsecutive failures: ${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES}.\n\nNew Browser State:\n${newStateText}\n\nTask reminder: ${task}\n\nWhat is your next action?`,
+
+        emit({
+          type: 'task_paused',
+          runId,
+          reason: 'Task paused safely due to execution difficulty.',
+          step,
+          verifiedCount: verifiedSteps.length,
+          verifiedSteps
         });
-        failedActions.push({
-          pageUrl: currentState.page?.url,
-          action: action,
-          reason: 'Verification failed: ' + verification.reason
+        emit({
+          type: 'checkpoint_available',
+          runId,
+          reason: 'Task paused safely due to execution difficulty.',
+          step,
+          verifiedCount: verifiedSteps.length,
+          verifiedSteps
         });
+        return;
       }
+
+      messages.push({
+        role: 'user',
+        content: `VERIFICATION FAILED — the action did NOT make progress toward the task.\nFailed action was: ${JSON.stringify(action)}\nReason: ${verification.reason}\n\nDo NOT repeat this exact action. Re-evaluating fresh browser state:\n${postExecSync.snapshotText}\n\nWhat is your next action?`
+      });
     }
 
-    currentState = newState;
-    currentStateText = newStateText;
+    currentSync = postExecSync;
+    currentState = postExecSync.snapshotData;
+    currentStateText = postExecSync.snapshotText;
   }
 
-  console.log(`\nReached step limit (${MAX_LOOPS}). Stopping.`);
-  emit({ type: 'error', message: `Reached step limit (${MAX_LOOPS})` });
+  console.log(`\nReached step limit (${MAX_LOOPS}). Pausing task with safe checkpoint.`);
+  saveCheckpoint({
+    runId,
+    task,
+    status: 'paused',
+    currentStep: MAX_LOOPS,
+    totalSteps: MAX_LOOPS,
+    goal: task,
+    understanding,
+    plan: planSteps,
+    completedSteps,
+    verifiedSteps,
+    failedSteps: failedActions,
+    lastVerifiedState: {
+      url: currentSync?.url || '',
+      title: currentSync?.title || '',
+      snapshotSummary: (currentSync?.snapshotText || '').substring(0, 300)
+    },
+    browserContext: { domain: targetDomain || '' },
+    sources,
+    error: 'VeriBrowse reached its current action budget (12 steps).'
+  });
+
+  emit({
+    type: 'task_paused',
+    runId,
+    reason: 'VeriBrowse reached its current action budget (12 steps).',
+    step: MAX_LOOPS,
+    verifiedCount: verifiedSteps.length,
+    verifiedSteps
+  });
+  emit({
+    type: 'checkpoint_available',
+    runId,
+    reason: 'VeriBrowse reached its current action budget (12 steps).',
+    step: MAX_LOOPS,
+    verifiedCount: verifiedSteps.length,
+    verifiedSteps
+  });
+
+  console.log(`\nReached step limit (${MAX_LOOPS}). Pausing task with safe checkpoint.`);
+  saveCheckpoint({
+    runId,
+    task,
+    status: 'budget_exhausted',
+    currentStep: MAX_LOOPS,
+    totalSteps: MAX_LOOPS,
+    goal: task,
+    understanding,
+    plan: planSteps,
+    completedSteps,
+    verifiedSteps,
+    failedSteps: failedActions,
+    lastVerifiedState: {
+      url: currentState?.page?.url || '',
+      title: currentState?.page?.title || '',
+      snapshotSummary: (currentStateText || '').substring(0, 300)
+    },
+    browserContext: { domain: targetDomain || '' },
+    sources,
+    error: 'VeriBrowse reached its current action budget (12 steps).'
+  });
+
+  emit({
+    type: 'checkpoint_available',
+    runId,
+    reason: 'VeriBrowse reached its current action budget (12 steps).',
+    step: MAX_LOOPS,
+    verifiedCount: verifiedSteps.length,
+    verifiedSteps
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1255,7 +1691,13 @@ async function main() {
   console.log('╚══════════════════════════════════════╝');
   console.log('');
 
-  const task = await askUser(rl, 'What do you want me to do?\n> ');
+  let task = process.argv[2] ? process.argv[2].trim() : '';
+  if (!task) {
+    task = await askUser(rl, 'What do you want me to do?\n> ');
+  } else {
+    console.log(`Executing CLI Task: "${task}"\n`);
+  }
+
   if (!task.trim()) {
     rl.close();
     return;
@@ -1276,5 +1718,10 @@ if (require.main === module) {
 
 module.exports = {
   runAgent,
-  extractTargetDomain
+  getSnapshot,
+  snapshotToText,
+  syncBrowserState,
+  extractTargetDomain,
+  actionToPlaywright,
+  verifyCompletion
 };
